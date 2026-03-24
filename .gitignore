@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.spec
+build/
+dist/
+
+data/*
+!data/.gitkeep
+
+logs/*
+!logs/.gitkeep
