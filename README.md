@@ -203,3 +203,4 @@ scripts\build_exe.bat
 Разработчик: Денчик Артур Станиславович  
 На базе: ФИЦ УУХ СО РАН
 "# DataFusion-RT" 
+"# DataFusion-RT" 
