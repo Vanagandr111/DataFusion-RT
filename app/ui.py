@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import logging
 import queue
+import subprocess
 import tkinter as tk
 import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-from app.config import resolve_path, save_config
+from app.config import load_config, resolve_path, save_config
+from app.logger_setup import reconfigure_file_logging
 from app.models import AcquisitionSnapshot, AppConfig, PortInfo
 from app.services.acquisition import AcquisitionController
 from app.services.device_probe import probe_furnace_port, probe_scale_port
@@ -38,8 +41,11 @@ DEFAULTS: dict[str, object] = {
     "app.poll_interval_sec": 1.0,
     "app.max_points_on_plot": 500,
     "app.test_mode": False,
-    "app.start_maximized": True,
+    "app.autosave_settings": False,
+    "app.enable_file_logging": False,
+    "app.start_maximized": False,
     "app.fullscreen": False,
+    "app.font_scale": 1.05,
     "app.theme": "dark",
     "app.csv_path": "data/measurements.csv",
     "app.log_path": "logs/app.log",
@@ -88,9 +94,40 @@ SETTINGS_SECTIONS: list[tuple[str, list[tuple[str, str, str, str, tuple[str, ...
             ("app.fullscreen", "Полный экран", "bool", "Если включено, окно откроется на весь экран.", None),
             ("app.csv_path", "Файл CSV", "entry", "Основной файл накопления измерений.", None),
             ("app.log_path", "Файл журнала", "entry", "Файл служебного журнала программы.", None),
+            ("app.enable_file_logging", "Включить автологирование", "bool", "Записывать служебный журнал в файл на диске.", None),
         ],
     ),
 ]
+
+
+TOOLTIP_DETAILS: dict[str, str] = {
+    "scale.enabled": "Отключите этот параметр, если весы физически не подключены, чтобы программа не тратила время на лишние попытки чтения.",
+    "scale.baudrate": "Если весы не отвечают, сначала проверьте именно эту скорость. Для Adam Highland HCB типичный стартовый вариант: 4800 бод.",
+    "scale.timeout": "Слишком маленький таймаут даст ложные ошибки, слишком большой замедлит опрос. Для начала обычно хватает 0.8-1.5 секунды.",
+    "scale.mode": "Режим auto обычно самый удобный: программа сначала ждёт поток, а если поток не идёт, отправляет команду опроса сама.",
+    "scale.request_command": "Меняйте это поле только если на реальном стенде выяснится, что весы требуют другую ASCII-команду. Обычно достаточно P\\r\\n.",
+    "furnace.enabled": "Если печь пока не подключена, можно временно снять галочку. Тогда программа продолжит работать только с весами.",
+    "furnace.baudrate": "Если есть связь по USB-RS485, но нет ответа Modbus, проверьте baudrate одним из первых параметров вместе с parity и slave ID.",
+    "furnace.bytesize": "У большинства контроллеров используется 8 бит данных. Меняйте только если это явно указано в документации контроллера.",
+    "furnace.parity": "Для Modbus RTU часто критично совпадение parity. Если N не работает, проверьте в документации варианты E или O.",
+    "furnace.stopbits": "Обычно используется 1 стоп-бит. Несовпадение этого параметра тоже может полностью ломать обмен по Modbus.",
+    "furnace.timeout": "Если контроллер отвечает медленно, попробуйте увеличить таймаут до 1.5-2.0 секунды, чтобы исключить ложные таймауты.",
+    "furnace.slave_id": "Это адрес Modbus-устройства. Если контроллер на шине не один, у каждого устройства должен быть свой адрес.",
+    "furnace.register_pv": "PV — это фактическая температура. Если значение выглядит странно или пусто, проверьте адрес регистра в паспорте контроллера.",
+    "furnace.register_sv": "SV — это заданная температура. Этот параметр читается только для отображения и не изменяет настройки печи.",
+    "furnace.scale_factor": "Если регистр возвращает, например, 253 вместо 25.3 °C, задайте коэффициент 0.1. Если приходит 2530, может понадобиться 0.01.",
+    "app.poll_interval_sec": "Для большинства задач 1 секунда удобно и достаточно. Уменьшайте интервал только если действительно нужна более частая запись.",
+    "app.max_points_on_plot": "Чем больше точек, тем длиннее история на экране, но тем тяжелее перерисовка графика на слабом ноутбуке.",
+    "app.test_mode": "Полезно для проверки интерфейса дома без оборудования: программа будет сама генерировать массу и температуру.",
+    "app.autosave_settings": "Когда автосохранение включено, корректные изменения применяются и записываются в config.yaml сразу. Если поле введено не полностью, сохранение подождёт валидного значения.",
+    "app.enable_file_logging": "Когда эта галочка выключена, программа пишет сообщения только в окно журнала и в консоль. Файл на диске не создаётся.",
+    "app.theme": "Переключайте тему под освещение лаборатории. Светлая удобнее для печати скриншотов, тёмная часто комфортнее при длительной работе.",
+    "app.start_maximized": "Рекомендуется оставить включённым для лабораторного ПК, чтобы все крупные элементы были сразу хорошо видны.",
+    "app.fullscreen": "Используйте только если хотите режим без рамок окна. Для обычной работы чаще удобнее просто развёрнутое окно.",
+    "app.csv_path": "Это основной файл накопления измерений. Убедитесь, что папка доступна на запись и не находится в защищённом системном каталоге.",
+    "app.log_path": "Если программа ведёт себя нестабильно, этот файл помогает понять причину. Логи удобно прикладывать при разборе ошибок.",
+    "app.font_scale": "Масштаб шрифта интерфейса. Увеличивайте, если на экране много мелкого текста. После резкого увеличения шрифта лучше перезапустить программу.",
+}
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -250,9 +287,16 @@ class LabForgeApp(tk.Tk):
         self.diag_ports_var = tk.StringVar(value="")
         self.diag_last_sample_var = tk.StringVar(value="Последний сэмпл: --")
         self.diag_last_time_var = tk.StringVar(value="Время: --")
+        self.autosave_settings_var = tk.BooleanVar(value=self.config_data.app.autosave_settings)
+        self.settings_mode_var = tk.StringVar(value="Ручное сохранение")
+        self.settings_mode_hint_var = tk.StringVar(value="Изменения записываются только после нажатия кнопки «Сохранить».")
+        self._suspend_settings_autosave = False
+        self._plot_panel_canvases: list[tk.Canvas] = []
+        self._plot_panel_bodies: list[ttk.Frame] = []
 
         self.setting_vars: dict[str, tk.Variable] = {}
         self._init_setting_vars()
+        self._bind_settings_autosave()
 
         self._build_layout()
         self._load_settings_into_vars()
@@ -267,7 +311,8 @@ class LabForgeApp(tk.Tk):
     def _compute_ui_scale(self) -> float:
         width = max(1280, self.winfo_screenwidth())
         height = max(800, self.winfo_screenheight())
-        return _clamp(min(width / 1680.0, height / 1020.0), 0.95, 1.3)
+        base_scale = _clamp(min(width / 1680.0, height / 1020.0), 0.95, 1.3)
+        return _clamp(base_scale * float(self.config_data.app.font_scale), 0.9, 1.7)
 
     def _apply_tk_scaling(self) -> None:
         try:
@@ -289,6 +334,10 @@ class LabForgeApp(tk.Tk):
                 return
             except Exception:
                 self.logger.debug("Zoomed window state is not available.", exc_info=True)
+                width = self.winfo_screenwidth()
+                height = self.winfo_screenheight()
+                self.geometry(f"{width}x{height}+0+0")
+                return
 
         width = int(self.winfo_screenwidth() * 0.92)
         height = int(self.winfo_screenheight() * 0.9)
@@ -303,7 +352,15 @@ class LabForgeApp(tk.Tk):
                 else:
                     self.setting_vars[key] = tk.StringVar(value=str(default))
 
+    def _bind_settings_autosave(self) -> None:
+        for var in self.setting_vars.values():
+            var.trace_add("write", self._on_setting_var_changed)
+        self.scale_port_display_var.trace_add("write", self._on_setting_var_changed)
+        self.furnace_port_display_var.trace_add("write", self._on_setting_var_changed)
+        self.autosave_settings_var.trace_add("write", self._on_autosave_toggle)
+
     def _load_settings_into_vars(self) -> None:
+        self._suspend_settings_autosave = True
         values = {
             "scale.enabled": self.config_data.scale.enabled,
             "scale.baudrate": self.config_data.scale.baudrate,
@@ -328,6 +385,7 @@ class LabForgeApp(tk.Tk):
             "app.theme": self.config_data.app.theme,
             "app.csv_path": self.config_data.app.csv_path,
             "app.log_path": self.config_data.app.log_path,
+            "app.enable_file_logging": self.config_data.app.enable_file_logging,
         }
         for key, value in values.items():
             var = self.setting_vars[key]
@@ -335,6 +393,8 @@ class LabForgeApp(tk.Tk):
                 var.set(bool(value))
             else:
                 var.set(str(value))
+        self.autosave_settings_var.set(self.config_data.app.autosave_settings)
+        self._suspend_settings_autosave = False
 
     def _build_layout(self) -> None:
         self.grid_rowconfigure(1, weight=1)
@@ -360,8 +420,13 @@ class LabForgeApp(tk.Tk):
         help_menu.add_command(label="Инструкция", command=self.show_help_dialog)
         help_menu.add_command(label="Об авторе", command=self.show_about_dialog)
         self.help_button.configure(menu=help_menu)
-        self.log_toggle_button = ttk.Button(right_tools, text="Лог", style="Soft.TButton", command=self.toggle_right_panel)
-        self.log_toggle_button.grid(row=0, column=3, padx=(0, self._pad_x(8)))
+        self.log_menu_button = tk.Menubutton(right_tools, text="Лог", relief="flat", bd=0, direction="below")
+        self.log_menu_button.grid(row=0, column=3, padx=(0, self._pad_x(8)))
+        log_menu = tk.Menu(self.log_menu_button, tearoff=False)
+        log_menu.add_command(label="Показать журнал", command=self.toggle_right_panel)
+        log_menu.add_command(label="Сохранить журнал в TXT", command=self.save_runtime_log)
+        log_menu.add_command(label="Открыть папку журналов", command=self.open_logs_folder)
+        self.log_menu_button.configure(menu=log_menu)
         self.settings_button = ttk.Button(right_tools, text="Настройки", style="Soft.TButton", command=self.open_settings_window)
         self.settings_button.grid(row=0, column=4)
 
@@ -387,13 +452,14 @@ class LabForgeApp(tk.Tk):
         self._build_center_panel()
 
         self.right_panel = ttk.Frame(self.body, style="Card.TFrame", padding=self._pad(14, 14))
-        self.right_panel.grid_rowconfigure(5, weight=1)
+        self.right_panel.grid_rowconfigure(6, weight=1)
         self.right_panel.grid_columnconfigure(0, weight=1)
         self._build_right_panel()
 
     def _build_top_menus(self, parent) -> None:
         self.option_add("*Menu.Font", f"{{Segoe UI}} {max(11, int(12 * self.ui_scale))}")
-        self.file_menu_button = self._make_menu_button(parent, "Файл")
+        self.option_add("*TCombobox*Listbox.Font", f"{{Segoe UI}} {max(11, int(12 * self.ui_scale))}")
+        self.file_menu_button = self._make_menu_button(parent, "Программа")
         file_menu = tk.Menu(self.file_menu_button, tearoff=False)
         file_menu.add_command(label="Экспорт CSV", command=lambda: self.export_measurements(default_ext=".csv"))
         file_menu.add_command(label="Экспорт Excel", command=lambda: self.export_measurements(default_ext=".xlsx"))
@@ -402,13 +468,16 @@ class LabForgeApp(tk.Tk):
         file_menu.add_command(label="Выход", command=self._on_close)
         self.file_menu_button.configure(menu=file_menu)
 
-        self.view_menu_button = self._make_menu_button(parent, "Вид")
-        view_menu = tk.Menu(self.view_menu_button, tearoff=False)
-        view_menu.add_radiobutton(label="Базовый режим", variable=self.view_mode_var, value="basic", command=self._apply_view_mode)
-        view_menu.add_radiobutton(label="Расширенный режим", variable=self.view_mode_var, value="advanced", command=self._apply_view_mode)
-        self.view_menu_button.configure(menu=view_menu)
         self.theme_switch_button = ttk.Button(parent, text="", style="Soft.TButton", command=self.toggle_theme)
         self.theme_switch_button.pack(side="left", padx=(0, self._pad_x(8)))
+        self.font_toolbar = ttk.Frame(parent, style="Header.TFrame")
+        self.font_toolbar.pack(side="left", padx=(0, self._pad_x(8)))
+        ttk.Label(self.font_toolbar, text="Размер шрифта", style="Subtitle.TLabel").grid(row=0, column=0, padx=(0, self._pad_x(6)))
+        ttk.Button(self.font_toolbar, text="-", style="Soft.TButton", command=lambda: self.adjust_font_scale(-0.05), width=3).grid(row=0, column=1, padx=(0, self._pad_x(4)))
+        self.font_scale_value_label = ttk.Label(self.font_toolbar, text="", style="Subtitle.TLabel", anchor="center")
+        self.font_scale_value_label.grid(row=0, column=2, padx=(0, self._pad_x(4)))
+        ttk.Button(self.font_toolbar, text="+", style="Soft.TButton", command=lambda: self.adjust_font_scale(0.05), width=3).grid(row=0, column=3, padx=(0, self._pad_x(4)))
+        ttk.Button(self.font_toolbar, text="Сброс", style="Soft.TButton", command=self.reset_font_scale).grid(row=0, column=4)
 
     def _make_menu_button(self, parent, text: str) -> tk.Menubutton:
         button = tk.Menubutton(parent, text=text, relief="flat", bd=0, direction="below")
@@ -575,8 +644,15 @@ class LabForgeApp(tk.Tk):
         ttk.Label(self.right_panel, textvariable=self.diag_last_time_var, style="CardText.TLabel").grid(row=3, column=0, sticky="w", pady=(self._pad_y(6), 0))
         ttk.Label(self.right_panel, textvariable=self.diag_status_var, style="CardText.TLabel", wraplength=int(360 * self.ui_scale)).grid(row=4, column=0, sticky="w", pady=(self._pad_y(6), self._pad_y(10)))
 
+        log_actions = ttk.Frame(self.right_panel, style="Card.TFrame")
+        log_actions.grid(row=5, column=0, sticky="ew", pady=(0, self._pad_y(8)))
+        log_actions.grid_columnconfigure(0, weight=1)
+        log_actions.grid_columnconfigure(1, weight=1)
+        ttk.Button(log_actions, text="Сохранить TXT", style="Soft.TButton", command=self.save_runtime_log).grid(row=0, column=0, sticky="ew", padx=(0, self._pad_x(6)))
+        ttk.Button(log_actions, text="Папка журналов", style="Soft.TButton", command=self.open_logs_folder).grid(row=0, column=1, sticky="ew", padx=(self._pad_x(6), 0))
+
         self.log_text = ScrolledText(self.right_panel, wrap="word", relief="flat", height=18)
-        self.log_text.grid(row=5, column=0, sticky="nsew")
+        self.log_text.grid(row=6, column=0, sticky="nsew")
         self.log_text.insert("end", "Журнал готов.\n")
         self.log_text.configure(state="disabled")
 
@@ -584,6 +660,8 @@ class LabForgeApp(tk.Tk):
         if hasattr(self, "_settings_window") and self._settings_window.winfo_exists():
             self._settings_window.focus_set()
             return
+
+        self._restore_settings_from_disk()
 
         self._settings_window = tk.Toplevel(self)
         self._settings_window.title("Настройки")
@@ -616,20 +694,69 @@ class LabForgeApp(tk.Tk):
         window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window_id, width=e.width))
+        self._bind_mousewheel_to_canvas(canvas)
         inner.grid_columnconfigure(0, weight=1)
         inner.grid_columnconfigure(1, weight=1)
 
-        hero = ttk.Frame(inner, style="Card.TFrame", padding=self._pad(16, 14))
+        hero = ttk.Frame(inner, style="Card.TFrame", padding=self._pad(12, 10))
         hero.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, self._pad_y(14)))
         hero.grid_columnconfigure(0, weight=1)
-        ttk.Label(hero, text="Параметры подключения и оформления", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(
+        hero.grid_columnconfigure(1, weight=0)
+        self.settings_title_label = ttk.Label(hero, text="⚙ Параметры подключения и оформления", style="CardTitle.TLabel")
+        self.settings_title_label.configure(font=("Segoe UI Semibold", max(15, int(17 * self.ui_scale))))
+        self.settings_title_label.grid(row=0, column=0, sticky="w")
+        self.settings_intro_label = ttk.Label(
             hero,
             text="Здесь можно выбрать порты, проверить устройства, настроить связь и внешний вид программы.",
             style="CardText.TLabel",
             wraplength=int(900 * self.ui_scale),
-        ).grid(row=1, column=0, sticky="w", pady=(self._pad_y(6), 0))
-
+        )
+        self.settings_intro_label.configure(font=("Segoe UI", max(11, int(12 * self.ui_scale))))
+        self.settings_intro_label.grid(row=1, column=0, sticky="w", pady=(0, 0))
+        hero_controls = ttk.Frame(hero, style="Card.TFrame")
+        hero_controls.grid(row=0, column=1, rowspan=2, sticky="ne", padx=(self._pad_x(10), 0))
+        for idx in range(3):
+            hero_controls.grid_columnconfigure(idx, weight=1)
+        self.settings_reset_button = ttk.Button(hero_controls, text="Сброс по умолчанию", style="Soft.TButton", command=self.reset_default_settings, width=18)
+        self.settings_reset_button.grid(row=0, column=0, sticky="ew", padx=(0, self._pad_x(6)))
+        self.settings_save_button = ttk.Button(hero_controls, text="Сохранить", style="Accent.TButton", command=self.save_settings, width=18)
+        self.settings_save_button.grid(row=0, column=1, sticky="ew", padx=self._pad_pair(3))
+        self.autosave_checkbox = ttk.Checkbutton(
+            hero_controls,
+            text="Автосохранение",
+            variable=self.autosave_settings_var,
+            style="Card.TCheckbutton",
+            takefocus=False,
+        )
+        self.autosave_checkbox.grid(row=1, column=1, sticky="w", pady=(self._pad_y(8), 0), padx=(0, self._pad_x(10)))
+        ToolTip(
+            self.autosave_checkbox,
+            self._build_setting_tooltip(
+                "app.autosave_settings",
+                "Автоматически сохраняет корректные изменения в config.yaml сразу после редактирования.",
+            ),
+        )
+        self.settings_mode_badge = tk.Label(
+            hero_controls,
+            textvariable=self.settings_mode_var,
+            anchor="w",
+            padx=self._pad_x(12),
+            pady=self._pad_y(6),
+            bd=1,
+            relief="solid",
+        )
+        self.settings_exit_button = ttk.Button(hero_controls, text="Выход", style="Soft.TButton", command=lambda: self._fade_out_and_destroy(self._settings_window), width=18)
+        self.settings_exit_button.grid(row=0, column=2, sticky="ew", padx=(self._pad_x(6), 0))
+        self.settings_mode_badge.grid(row=1, column=2, sticky="ew", pady=(self._pad_y(8), 0))
+        self.settings_mode_hint = ttk.Label(
+            hero_controls,
+            textvariable=self.settings_mode_hint_var,
+            style="CardText.TLabel",
+            wraplength=int(620 * self.ui_scale),
+            justify="left",
+        )
+        self.settings_mode_hint.configure(font=("Segoe UI", max(10, int(11 * self.ui_scale))))
+        self.settings_mode_hint.grid(row=3, column=1, columnspan=2, sticky="w", pady=(self._pad_y(4), 0))
         devices_frame = ttk.LabelFrame(inner, text="Устройства", style="Section.TLabelframe", padding=self._pad(14, 12))
         devices_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, self._pad_y(14)))
         devices_frame.grid_columnconfigure(1, weight=1)
@@ -637,6 +764,7 @@ class LabForgeApp(tk.Tk):
 
         ttk.Label(devices_frame, text="Порт весов", style="CardText.TLabel").grid(row=0, column=0, sticky="w", padx=(0, self._pad_x(12)), pady=(self._pad_y(6), self._pad_y(6)))
         self.settings_scale_combo = ttk.Combobox(devices_frame, textvariable=self.scale_port_display_var, width=96)
+        self.settings_scale_combo.configure(font=("Segoe UI", max(11, int(12 * self.ui_scale))))
         self.settings_scale_combo.grid(row=0, column=1, sticky="ew", pady=(self._pad_y(6), self._pad_y(6)))
         ttk.Label(
             devices_frame,
@@ -647,6 +775,7 @@ class LabForgeApp(tk.Tk):
 
         ttk.Label(devices_frame, text="Порт печи", style="CardText.TLabel").grid(row=1, column=0, sticky="w", padx=(0, self._pad_x(12)), pady=(self._pad_y(6), self._pad_y(6)))
         self.settings_furnace_combo = ttk.Combobox(devices_frame, textvariable=self.furnace_port_display_var, width=96)
+        self.settings_furnace_combo.configure(font=("Segoe UI", max(11, int(12 * self.ui_scale))))
         self.settings_furnace_combo.grid(row=1, column=1, sticky="ew", pady=(self._pad_y(6), self._pad_y(6)))
         ttk.Label(
             devices_frame,
@@ -691,15 +820,8 @@ class LabForgeApp(tk.Tk):
             frame.grid_columnconfigure(2, weight=1)
             self._build_settings_section(frame, fields)
 
-        actions = ttk.Frame(inner, style="App.TFrame")
-        actions.grid(row=4, column=0, columnspan=2, sticky="ew")
-        for idx in range(3):
-            actions.grid_columnconfigure(idx, weight=1)
-        ttk.Button(actions, text="Сохранить", style="Accent.TButton", command=self.save_settings).grid(row=0, column=0, sticky="ew", padx=(0, self._pad_x(8)))
-        ttk.Button(actions, text="По умолчанию", style="Soft.TButton", command=self.reset_default_settings).grid(row=0, column=1, sticky="ew", padx=self._pad_pair(4))
-        ttk.Button(actions, text="Закрыть", style="Soft.TButton", command=lambda: self._fade_out_and_destroy(self._settings_window)).grid(row=0, column=2, sticky="ew", padx=(self._pad_x(8), 0))
-
         self._apply_theme_to_toplevel(self._settings_window)
+        self._update_settings_control_states()
         self._fade_in_toplevel(self._settings_window)
 
     def _build_settings_section(self, parent, fields) -> None:
@@ -707,26 +829,35 @@ class LabForgeApp(tk.Tk):
         parent.grid_columnconfigure(1, weight=1, minsize=int(210 * self.ui_scale))
         parent.grid_columnconfigure(2, weight=1, minsize=int(260 * self.ui_scale))
         for row, (key, label, kind, tooltip, choices) in enumerate(fields):
+            tooltip_text = self._build_setting_tooltip(key, tooltip)
             label_widget = ttk.Label(parent, text=label, style="CardText.TLabel")
+            label_widget.configure(font=("Segoe UI", max(11, int(12 * self.ui_scale))))
             label_widget.grid(row=row, column=0, sticky="w", padx=(0, self._pad_x(12)), pady=(self._pad_y(6), self._pad_y(6)))
-            ToolTip(label_widget, f"{tooltip}\nПо умолчанию: {DEFAULTS[key]}")
+            ToolTip(label_widget, tooltip_text)
 
             var = self.setting_vars[key]
             if kind == "bool":
-                widget = ttk.Checkbutton(parent, variable=var)
+                widget = ttk.Checkbutton(parent, variable=var, style="Card.TCheckbutton", takefocus=False)
+                widget.configure(text=" ")
             elif kind == "combo":
                 widget = ttk.Combobox(parent, textvariable=var, state="readonly", values=list(choices or ()))
             else:
                 widget = ttk.Entry(parent, textvariable=var)
+            if kind in {"combo", "entry"}:
+                widget.configure(font=("Segoe UI", max(11, int(12 * self.ui_scale))))
+            if kind == "bool":
+                widget.configure(style="Card.TCheckbutton")
             widget.grid(row=row, column=1, sticky="ew", pady=(self._pad_y(6), self._pad_y(6)))
-            ttk.Label(parent, text=f"{tooltip} По умолчанию: {DEFAULTS[key]}", style="CardAltText.TLabel", wraplength=int(340 * self.ui_scale)).grid(
+            hint_label = ttk.Label(parent, text=f"{tooltip} По умолчанию: {DEFAULTS[key]}", style="CardAltText.TLabel", wraplength=int(420 * self.ui_scale))
+            hint_label.configure(font=("Segoe UI", max(11, int(12 * self.ui_scale))))
+            hint_label.grid(
                 row=row,
                 column=2,
                 sticky="w",
                 padx=(self._pad_x(12), 0),
                 pady=(self._pad_y(6), self._pad_y(6)),
             )
-            ToolTip(widget, tooltip)
+            ToolTip(widget, tooltip_text)
 
     def refresh_ports(self) -> None:
         self.available_ports = list_available_ports()
@@ -1017,15 +1148,29 @@ class LabForgeApp(tk.Tk):
         self.configure(bg=palette.app_bg)
         self.header_status.configure(bg=palette.header_bg, fg=palette.subtext, font=("Segoe UI", max(11, int(12 * self.ui_scale))))
         self._style_menu_button(self.file_menu_button, palette)
-        self._style_menu_button(self.view_menu_button, palette)
         self._style_menu_button(self.help_button, palette)
+        self._style_menu_button(self.log_menu_button, palette)
         self.theme_switch_button.configure(text="Тема: светлая" if palette.name == "light" else "Тема: тёмная")
         self.log_text.configure(background=palette.input_bg, foreground=palette.text, insertbackground=palette.text, font=("Consolas", max(10, int(11 * self.ui_scale))))
+        if hasattr(self, "settings_mode_badge") and self.settings_mode_badge.winfo_exists():
+            self._update_settings_control_states()
+        if hasattr(self, "font_scale_value_label") and self.font_scale_value_label.winfo_exists():
+            self.font_scale_value_label.configure(text=f"{int(round(self.config_data.app.font_scale * 100))}%")
         for card in (self.mass_card, self.temp_card, self.status_card, self.time_card):
             card.apply_theme(palette, self.ui_scale)
         self._style_indicator(self.scale_indicator, palette)
         self._style_indicator(self.furnace_indicator, palette)
         self.plotter.apply_theme(palette.plot, scale=self.ui_scale)
+        for canvas in self._plot_panel_canvases:
+            try:
+                canvas.configure(background=palette.card_alt_bg)
+            except Exception:
+                pass
+        for body in self._plot_panel_bodies:
+            try:
+                body.configure(style="CardAlt.TFrame")
+            except Exception:
+                pass
         if hasattr(self, "_settings_window") and self._settings_window.winfo_exists():
             self._apply_theme_to_toplevel(self._settings_window)
         self._update_action_buttons()
@@ -1053,6 +1198,23 @@ class LabForgeApp(tk.Tk):
             highlightthickness=1,
             highlightbackground=palette.border,
         )
+
+    def _bind_mousewheel_to_canvas(self, canvas: tk.Canvas) -> None:
+        def on_mousewheel(event) -> None:
+            delta = 0
+            if getattr(event, "delta", 0):
+                delta = -1 if event.delta > 0 else 1
+            elif getattr(event, "num", None) == 4:
+                delta = -1
+            elif getattr(event, "num", None) == 5:
+                delta = 1
+            if delta:
+                canvas.yview_scroll(delta, "units")
+
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", on_mousewheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        canvas.bind_all("<Button-4>", on_mousewheel)
+        canvas.bind_all("<Button-5>", on_mousewheel)
 
     def _style_indicator(self, indicator: dict[str, object], palette: ThemePalette) -> None:
         frame = indicator["frame"]
@@ -1119,7 +1281,8 @@ class LabForgeApp(tk.Tk):
         self._set_log_button_text()
 
     def _set_log_button_text(self) -> None:
-        self.log_toggle_button.configure(text="Лог ▾" if self.right_panel_visible else "Лог")
+        if hasattr(self, "log_menu_button"):
+            self.log_menu_button.configure(text="Лог ▾" if self.right_panel_visible else "Лог")
 
     def _fade_in_toplevel(self, window: tk.Toplevel, *, current: float = 0.0) -> None:
         try:
@@ -1133,6 +1296,9 @@ class LabForgeApp(tk.Tk):
     def _fade_out_and_destroy(self, window: tk.Toplevel | None, *, current: float | None = None) -> None:
         if window is None or not window.winfo_exists():
             return
+
+        if current is None and window is getattr(self, "_settings_window", None) and not bool(self.autosave_settings_var.get()):
+            self._restore_settings_from_disk()
 
         if current is None:
             try:
@@ -1238,6 +1404,103 @@ class LabForgeApp(tk.Tk):
             return ""
         return self.port_display_map.get(port_name.upper(), port_name)
 
+    def _build_setting_tooltip(self, key: str, short_text: str) -> str:
+        extra = TOOLTIP_DETAILS.get(key, "")
+        default_text = f"По умолчанию: {DEFAULTS[key]}"
+        if extra:
+            return f"{short_text}\n\nПодсказка:\n{extra}\n\n{default_text}"
+        return f"{short_text}\n\n{default_text}"
+
+    def _restore_settings_from_disk(self) -> None:
+        self._suspend_settings_autosave = True
+        try:
+            self.config_data = load_config(self.config_path)
+            self.scale_port_var.set(self.config_data.scale.port)
+            self.furnace_port_var.set(self.config_data.furnace.port)
+            self._load_settings_into_vars()
+            self._sync_port_display_vars()
+            self.theme_manager.set_theme(self.config_data.app.theme)
+            self.plotter.set_max_points(self.config_data.app.max_points_on_plot)
+            self._apply_theme()
+        finally:
+            self._suspend_settings_autosave = False
+
+    def _on_setting_var_changed(self, *_args) -> None:
+        if self._suspend_settings_autosave:
+            return
+        if "app.start_maximized" in self.setting_vars and "app.fullscreen" in self.setting_vars:
+            start_maximized = bool(self.setting_vars["app.start_maximized"].get())
+            fullscreen_var = self.setting_vars["app.fullscreen"]
+            if not start_maximized and bool(fullscreen_var.get()):
+                self._suspend_settings_autosave = True
+                try:
+                    fullscreen_var.set(False)
+                finally:
+                    self._suspend_settings_autosave = False
+        if bool(self.autosave_settings_var.get()):
+            self._autosave_settings_silent()
+
+    def _on_autosave_toggle(self, *_args) -> None:
+        if self._suspend_settings_autosave:
+            return
+        enabled = bool(self.autosave_settings_var.get())
+        if enabled:
+            # When autosave is enabled after manual edits, persist the current UI state immediately.
+            self._autosave_settings_silent()
+            self.config_data.app.autosave_settings = True
+            save_config(self.config_data, self.config_path)
+            self._update_settings_control_states()
+            self._set_status("Автосохранение настроек включено.", emit_log=False)
+        else:
+            self.config_data.app.autosave_settings = False
+            save_config(self.config_data, self.config_path)
+            self._update_settings_control_states()
+            self._set_status("Автосохранение настроек выключено.", emit_log=False)
+
+    def _autosave_settings_silent(self) -> None:
+        before = dataclasses.asdict(self.config_data)
+        if not self._commit_settings_to_config(show_errors=False):
+            return
+        save_config(self.config_data, self.config_path)
+        reconfigure_file_logging(resolve_path(self.config_data.app.log_path), enable_file_logging=self.config_data.app.enable_file_logging)
+        self._sync_port_display_vars()
+        self.plotter.set_max_points(self.config_data.app.max_points_on_plot)
+        self.theme_manager.set_theme(self.config_data.app.theme)
+        self.ui_scale = self._compute_ui_scale()
+        self._apply_tk_scaling()
+        self._apply_theme()
+        self.diag_status_var.set("Настройки автоматически сохранены.")
+        self._log_settings_changes(before, dataclasses.asdict(self.config_data))
+        self._update_settings_control_states()
+
+    def _update_settings_control_states(self) -> None:
+        autosave_enabled = bool(self.autosave_settings_var.get())
+        if hasattr(self, "settings_save_button") and self.settings_save_button.winfo_exists():
+            self.settings_save_button.state(["disabled"] if autosave_enabled else ["!disabled"])
+        if hasattr(self, "settings_mode_badge") and self.settings_mode_badge.winfo_exists():
+            palette = self.theme_manager.palette
+            if autosave_enabled:
+                self.settings_mode_var.set("💾 Автосохранение включено")
+                self.settings_mode_hint_var.set("Корректные изменения применяются и записываются в config.yaml сразу после редактирования.")
+                badge_bg = palette.accent
+                badge_fg = "#081016" if palette.name == "dark" else "#FFFFFF"
+                badge_border = _blend_color(palette.accent, palette.border, 0.6)
+            else:
+                self.settings_mode_var.set("✍ Ручное сохранение")
+                self.settings_mode_hint_var.set("Изменения записываются только после нажатия кнопки «Сохранить».")
+                badge_bg = palette.warning
+                badge_fg = "#1F1308" if palette.name == "dark" else "#FFFFFF"
+                badge_border = _blend_color(palette.warning, palette.border, 0.6)
+            self.settings_mode_badge.configure(
+                bg=badge_bg,
+                fg=badge_fg,
+                font=("Segoe UI Semibold", max(10, int(11 * self.ui_scale))),
+                highlightbackground=badge_border,
+                highlightcolor=badge_border,
+                highlightthickness=1,
+                borderwidth=1,
+            )
+
     def _settings_port_label(self, port: PortInfo) -> str:
         return f"{port.device} - {port.description} - {guess_port_kind(port)}"
 
@@ -1272,11 +1535,13 @@ class LabForgeApp(tk.Tk):
             self.config_data.app.poll_interval_sec = self._get_float("app.poll_interval_sec")
             self.config_data.app.max_points_on_plot = self._get_int("app.max_points_on_plot")
             self.config_data.app.test_mode = self._get_bool("app.test_mode")
+            self.config_data.app.autosave_settings = bool(self.autosave_settings_var.get())
             self.config_data.app.start_maximized = self._get_bool("app.start_maximized")
-            self.config_data.app.fullscreen = self._get_bool("app.fullscreen")
+            self.config_data.app.fullscreen = self._get_bool("app.fullscreen") if self.config_data.app.start_maximized else False
             self.config_data.app.theme = self._get_str("app.theme").lower()
             self.config_data.app.csv_path = self._get_str("app.csv_path")
             self.config_data.app.log_path = self._get_str("app.log_path")
+            self.config_data.app.enable_file_logging = self._get_bool("app.enable_file_logging")
             return True
         except ValueError as exc:
             self._set_status(str(exc), logging.WARNING)
@@ -1286,24 +1551,43 @@ class LabForgeApp(tk.Tk):
             return False
 
     def save_settings(self) -> None:
+        if bool(self.autosave_settings_var.get()):
+            self._update_settings_control_states()
+            return
+        before = dataclasses.asdict(self.config_data)
         if not self._commit_settings_to_config(show_errors=True):
             return
         save_config(self.config_data, self.config_path)
+        reconfigure_file_logging(resolve_path(self.config_data.app.log_path), enable_file_logging=self.config_data.app.enable_file_logging)
         self._sync_port_display_vars()
         self.plotter.set_max_points(self.config_data.app.max_points_on_plot)
         self.theme_manager.set_theme(self.config_data.app.theme)
+        self.ui_scale = self._compute_ui_scale()
+        self._apply_tk_scaling()
         self._apply_theme()
         self._set_status("Настройки сохранены.")
         self.diag_status_var.set("Настройки сохранены.")
+        self._log_settings_changes(before, dataclasses.asdict(self.config_data))
+        self._update_settings_control_states()
 
     def reset_default_settings(self) -> None:
-        for key, value in DEFAULTS.items():
-            var = self.setting_vars[key]
-            if isinstance(var, tk.BooleanVar):
-                var.set(bool(value))
-            else:
-                var.set(str(value))
+        self._suspend_settings_autosave = True
+        try:
+            for key, value in DEFAULTS.items():
+                if key not in self.setting_vars:
+                    continue
+                var = self.setting_vars[key]
+                if isinstance(var, tk.BooleanVar):
+                    var.set(bool(value))
+                else:
+                    var.set(str(value))
+            self.autosave_settings_var.set(bool(DEFAULTS["app.autosave_settings"]))
+        finally:
+            self._suspend_settings_autosave = False
+        if bool(self.autosave_settings_var.get()):
+            self._autosave_settings_silent()
         self._set_status("Значения по умолчанию восстановлены.")
+        self._update_settings_control_states()
 
     def _make_plot_tool_button(self, parent, text: str, command, *, width: int | None = None) -> ttk.Button:
         button = ttk.Button(parent, text=text, command=command, style="Soft.TButton", width=width)
@@ -1330,6 +1614,8 @@ class LabForgeApp(tk.Tk):
         canvas.configure(yscrollcommand=scrollbar.set)
 
         body = ttk.Frame(canvas, style="CardAlt.TFrame")
+        self._plot_panel_canvases.append(canvas)
+        self._plot_panel_bodies.append(body)
         window_id = canvas.create_window((0, 0), window=body, anchor="nw")
         def update_scrollbar(_event=None) -> None:
             canvas.configure(scrollregion=canvas.bbox("all"))
@@ -1344,7 +1630,7 @@ class LabForgeApp(tk.Tk):
         return panel, body
 
     def _set_plot_button_selected(self, button: ttk.Button, selected: bool) -> None:
-        button.state(["pressed"] if selected else ["!pressed"])
+        button.configure(style="SelectedSoft.TButton" if selected else "Soft.TButton")
 
     def _update_plot_mode_buttons(self) -> None:
         if not hasattr(self, "plot_mode_buttons"):
@@ -1497,6 +1783,63 @@ class LabForgeApp(tk.Tk):
         self.stop_button.state(["!disabled"] if self.controller.running else ["disabled"])
         self.tare_button.state(["!disabled"] if self._scale_actions_allowed() else ["disabled"])
         self.zero_button.state(["!disabled"] if self._scale_actions_allowed() else ["disabled"])
+
+    def save_runtime_log(self) -> None:
+        target = filedialog.asksaveasfilename(
+            parent=self,
+            title="Сохранить журнал",
+            defaultextension=".txt",
+            filetypes=[("Текстовый файл", "*.txt"), ("Все файлы", "*.*")],
+            initialfile="datafusion_rt_log.txt",
+        )
+        if not target:
+            return
+        content = self.log_text.get("1.0", "end-1c").strip()
+        if not content:
+            messagebox.showinfo("Журнал", "Журнал пока пуст.", parent=self)
+            return
+        Path(target).write_text(content + "\n", encoding="utf-8")
+        self._set_status(f"Журнал сохранён: {target}")
+
+    def open_logs_folder(self) -> None:
+        folder = resolve_path(self.config_data.app.log_path).parent
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            subprocess.Popen(["explorer", str(folder)])
+            self._set_status(f"Открыта папка журналов: {folder}", emit_log=False)
+        except Exception as exc:
+            self._set_status(f"Не удалось открыть папку журналов: {exc}", logging.WARNING)
+
+    def adjust_font_scale(self, delta: float) -> None:
+        self._apply_font_scale_value(_clamp(float(self.config_data.app.font_scale) + delta, 0.9, 1.6))
+
+    def reset_font_scale(self) -> None:
+        self._apply_font_scale_value(1.0)
+
+    def _apply_font_scale_value(self, value: float) -> None:
+        rounded = round(value, 2)
+        self.config_data.app.font_scale = rounded
+        self.ui_scale = self._compute_ui_scale()
+        self._apply_tk_scaling()
+        self._apply_theme()
+        if hasattr(self, "font_scale_value_label") and self.font_scale_value_label.winfo_exists():
+            self.font_scale_value_label.configure(text=f"{int(round(rounded * 100))}%")
+        if bool(self.autosave_settings_var.get()):
+            save_config(self.config_data, self.config_path)
+        self._set_status(f"Размер шрифта: {int(round(rounded * 100))}%.", emit_log=False)
+
+    def _log_settings_changes(self, before: dict[str, object], after: dict[str, object]) -> None:
+        changes: list[str] = []
+        for section_name, section_values in after.items():
+            previous_section = before.get(section_name, {})
+            if not isinstance(section_values, dict) or not isinstance(previous_section, dict):
+                continue
+            for key, value in section_values.items():
+                old_value = previous_section.get(key)
+                if old_value != value:
+                    changes.append(f"{section_name}.{key}: {old_value} -> {value}")
+        if changes:
+            self.logger.info("Изменены настройки: %s", "; ".join(changes))
 
     def _set_status(self, message: str, level: int = logging.INFO, *, emit_log: bool = True) -> None:
         self.status_var.set(message)

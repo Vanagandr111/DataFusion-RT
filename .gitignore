@@ -1,14 +1,62 @@
-.venv/
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.spec
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build / packaging
 build/
 dist/
+*.spec
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
 
+# Test / cache / tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# IDE / editor
+.idea/
+.vscode/
+*.code-workspace
+*.suo
+*.user
+*.userossc
+*.sln.docstates
+Thumbs.db
+Desktop.ini
+
+# Local environment files
+.env
+.env.*
+
+# Runtime data
 data/*
 !data/.gitkeep
 
 logs/*
 !logs/.gitkeep
+
+# Generated measurements / exports
+*.csv
+*.xlsx
+*.xls
+*.xml
+*.png
+
+# Keep tracked config, ignore only temporary backups
+config/*.bak
+config/*.tmp
+config/*~

@@ -52,6 +52,7 @@ class LivePlotter:
         self.canvas = FigureCanvasTkAgg(self.figure, master=self.container)
         self.canvas_widget = self.canvas.get_tk_widget()
         self.canvas_widget.pack(fill="both", expand=True)
+        self.canvas.mpl_connect("scroll_event", self._on_scroll)
 
         self._toolbar_host = ttk.Frame(self.container)
         self._toolbar = NavigationToolbar2Tk(self.canvas, self._toolbar_host, pack_toolbar=False)
@@ -415,6 +416,14 @@ class LivePlotter:
             half_span = max((right_num - left_num) * factor / 2.0, 1e-6)
             self.ax_main.set_xlim(center_num - half_span, center_num + half_span)
         self.canvas.draw_idle()
+
+    def _on_scroll(self, event) -> None:
+        if not self._zoom_active or event.inaxes is None:
+            return
+        if getattr(event, "button", "") == "up":
+            self._zoom_axes(0.88)
+        elif getattr(event, "button", "") == "down":
+            self._zoom_axes(1.14)
 
     def _reset_toolbar_modes(self) -> None:
         if self._zoom_active:

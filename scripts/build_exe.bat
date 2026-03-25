@@ -27,7 +27,7 @@ if exist build rmdir /s /q build
 if exist dist\DataFusion-RT rmdir /s /q dist\DataFusion-RT
 
 echo Building EXE...
-pyinstaller --noconfirm --clean --onedir --name DataFusion-RT --distpath dist --workpath build --specpath build app\main.py
+pyinstaller --noconfirm --clean --windowed --onedir --name DataFusion-RT --distpath dist --workpath build --specpath build app\main.py
 if errorlevel 1 goto :error
 
 if not exist "dist\DataFusion-RT\config" mkdir "dist\DataFusion-RT\config"

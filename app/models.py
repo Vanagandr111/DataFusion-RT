@@ -35,9 +35,12 @@ class ApplicationConfig:
     log_path: str
     max_points_on_plot: int
     test_mode: bool = False
+    autosave_settings: bool = False
+    enable_file_logging: bool = False
     theme: str = "dark"
-    start_maximized: bool = True
+    start_maximized: bool = False
     fullscreen: bool = False
+    font_scale: float = 1.0
     default_export_format: str = "csv"
 
 

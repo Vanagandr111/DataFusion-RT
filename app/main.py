@@ -46,7 +46,7 @@ def main() -> int:
         print(f"Failed to load config: {exc}", file=sys.stderr)
         return 1
 
-    logger = setup_logging(resolve_path(config.app.log_path))
+    logger = setup_logging(resolve_path(config.app.log_path), enable_file_logging=config.app.enable_file_logging)
     logger.info("DataFusion RT starting.")
     logger.info("Config path: %s", config_path)
     _log_port_diagnostics(logger, config)

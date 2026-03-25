@@ -202,5 +202,48 @@ scripts\build_exe.bat
 
 Разработчик: Денчик Артур Станиславович  
 На базе: ФИЦ УУХ СО РАН
+
+## Git и GitHub
+
+В репозиторий рекомендуется отправлять только код, конфиги, bat-скрипты и документацию.
+
+`.gitignore` уже исключает:
+
+- виртуальное окружение `.venv/`;
+- папки сборки `build/`, `dist/`;
+- кэши Python и IDE;
+- содержимое `data/` и `logs/`, кроме `.gitkeep`;
+- экспортированные `CSV`, `XLSX`, `XML`, `PNG`.
+
+Что обычно коммитить:
+
+- `app/`
+- `config/config.example.yaml`
+- `config/config.yaml` если он у вас без секретов и с рабочими базовыми значениями
+- `scripts/`
+- `requirements.txt`
+- `README.md`
+
+Что обычно не коммитить:
+
+- реальные файлы измерений;
+- логи с оборудования;
+- локальную `.venv`;
+- `dist/` после сборки `exe`.
+
+Базовые команды:
+
+```bat
+git status
+git add .
+git commit -m "Update DataFusion RT"
+git push
+```
+
+Если push по SSH не работает, сначала настройте ключ и проверьте:
+
+```bat
+ssh -T git@github.com
+```
 "# DataFusion-RT" 
 "# DataFusion-RT" 

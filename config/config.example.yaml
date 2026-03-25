@@ -25,7 +25,10 @@ app:
   log_path: "logs/app.log"
   max_points_on_plot: 500
   test_mode: false
+  autosave_settings: false
+  enable_file_logging: false
   theme: "dark"
   start_maximized: true
   fullscreen: false
+  font_scale: 1.05
   default_export_format: "csv"

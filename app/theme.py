@@ -168,19 +168,19 @@ class ThemeManager:
             "CardTitle.TLabel",
             background=palette.card_bg,
             foreground=palette.text,
-            font=("Segoe UI Semibold", size(12)),
+            font=("Segoe UI Semibold", size(13)),
         )
         style.configure(
             "CardText.TLabel",
             background=palette.card_bg,
             foreground=palette.subtext,
-            font=("Segoe UI", size(10)),
+            font=("Segoe UI", size(11)),
         )
         style.configure(
             "CardAltText.TLabel",
             background=palette.card_alt_bg,
             foreground=palette.subtext,
-            font=("Segoe UI", size(10)),
+            font=("Segoe UI", size(11)),
         )
         style.configure(
             "Accent.TButton",
@@ -210,7 +210,7 @@ class ThemeManager:
         )
         style.configure(
             "Soft.TButton",
-            font=("Segoe UI", size(10)),
+            font=("Segoe UI", size(11)),
             padding=(size(12), size(8)),
             background=palette.button_soft_bg,
             foreground=palette.text,
@@ -223,10 +223,59 @@ class ThemeManager:
             bordercolor=[("active", palette.accent), ("disabled", palette.border)],
         )
         style.configure(
-            "TCheckbutton",
+            "SelectedSoft.TButton",
+            font=("Segoe UI Semibold", size(10)),
+            padding=(size(12), size(8)),
+            background=palette.accent if palette.name == "dark" else "#D6F2EE",
+            foreground="#081016" if palette.name == "dark" else "#0F3F3A",
+            bordercolor=palette.accent,
+            borderwidth=1,
+            relief="solid",
+        )
+        style.map(
+            "SelectedSoft.TButton",
+            background=[("active", "#55E2CF" if palette.name == "dark" else "#C6ECE6"), ("disabled", palette.accent_dim)],
+            foreground=[("disabled", palette.disabled)],
+            bordercolor=[("active", palette.accent), ("disabled", palette.border)],
+        )
+        style.configure(
+            "Card.TCheckbutton",
             background=palette.card_bg,
             foreground=palette.text,
-            font=("Segoe UI", size(10)),
+            font=("Segoe UI", size(11)),
+            indicatorcolor=palette.input_bg,
+            indicatorbackground=palette.input_bg,
+            focuscolor=palette.card_bg,
+            lightcolor=palette.card_bg,
+            darkcolor=palette.card_bg,
+            bordercolor=palette.border,
+        )
+        style.map(
+            "Card.TCheckbutton",
+            background=[
+                ("active", palette.card_bg),
+                ("selected", palette.card_bg),
+                ("disabled", palette.card_bg),
+            ],
+            foreground=[
+                ("disabled", palette.disabled),
+                ("active", palette.text),
+                ("selected", palette.text),
+            ],
+            indicatorcolor=[
+                ("selected", palette.accent),
+                ("disabled", palette.disabled),
+                ("!selected", palette.input_bg),
+            ],
+            indicatorbackground=[
+                ("selected", palette.accent),
+                ("disabled", palette.disabled),
+                ("!selected", palette.input_bg),
+            ],
+            focuscolor=[
+                ("focus", palette.card_bg),
+                ("!focus", palette.card_bg),
+            ],
         )
         style.configure(
             "TEntry",
@@ -236,6 +285,8 @@ class ThemeManager:
             bordercolor=palette.border,
             lightcolor=palette.border,
             darkcolor=palette.border,
+            font=("Segoe UI", size(11)),
+            padding=(size(8), size(6)),
         )
         style.configure(
             "TCombobox",
@@ -246,7 +297,8 @@ class ThemeManager:
             bordercolor=palette.border,
             lightcolor=palette.border,
             darkcolor=palette.border,
-            padding=(size(6), size(4)),
+            font=("Segoe UI", size(11)),
+            padding=(size(8), size(6)),
         )
         style.map(
             "TCombobox",
@@ -264,14 +316,44 @@ class ThemeManager:
         )
         style.configure(
             "Treeview.Heading",
-            font=("Segoe UI Semibold", size(10)),
+            font=("Segoe UI Semibold", size(11)),
             background=palette.button_soft_bg,
             foreground=palette.text,
             bordercolor=palette.border,
+        )
+        style.configure(
+            "Section.TLabelframe.Label",
+            background=palette.card_bg,
+            foreground=palette.text,
+            font=("Segoe UI Semibold", size(12)),
         )
         style.map(
             "Treeview",
             background=[("selected", palette.tree_selected)],
             foreground=[("selected", palette.text)],
+        )
+        style.configure(
+            "TScrollbar",
+            background=palette.button_soft_bg,
+            troughcolor=palette.card_alt_bg,
+            bordercolor=palette.border,
+            lightcolor=palette.border,
+            darkcolor=palette.border,
+            arrowcolor=palette.text,
+            gripcount=0,
+            arrowsize=size(12),
+            width=size(14),
+            relief="flat",
+        )
+        style.map(
+            "TScrollbar",
+            background=[
+                ("active", palette.accent if palette.name == "dark" else palette.button_soft_active),
+                ("pressed", palette.accent if palette.name == "dark" else palette.accent),
+            ],
+            arrowcolor=[
+                ("active", "#081016" if palette.name == "dark" else "#FFFFFF"),
+                ("pressed", "#081016" if palette.name == "dark" else "#FFFFFF"),
+            ],
         )
         return style
