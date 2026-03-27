@@ -697,50 +697,38 @@ class LabForgeApp(tk.Tk):
 
         self._settings_window = tk.Toplevel(self)
         self._settings_window.title("Настройки")
-        self._settings_window.transient(self)
         self._settings_window.grab_set()
         self._settings_window.protocol("WM_DELETE_WINDOW", self._close_settings_window)
+        self._settings_window.grid_rowconfigure(0, weight=1)
+        self._settings_window.grid_columnconfigure(0, weight=1)
+        self._settings_window._datafusion_zoomed = False  # type: ignore[attr-defined]
+        self._settings_window.resizable(True, True)
+
         area = _windows_work_area()
         if area is not None:
             x, y, width, height = area
-            min_width = min(max(int(960 * self.ui_scale), 900), max(width - 24, 640))
-            min_height = min(max(int(680 * self.ui_scale), 620), max(height - 24, 480))
-            win_width = max(min_width, width - 16)
-            win_height = max(min_height, height - 16)
+            min_width = min(max(int(920 * self.ui_scale), 820), max(width - 24, 680))
+            min_height = min(max(int(660 * self.ui_scale), 620), max(height - 24, 520))
+            win_width = min(max(min_width, int(width * 0.56)), max(width - 24, min_width))
+            win_height = min(max(min_height, int(height * 0.72)), max(height - 28, min_height))
             self._settings_window.minsize(min_width, min_height)
             self._settings_window.maxsize(width, height)
             self._settings_window.geometry(f"{win_width}x{win_height}+{x + 8}+{y + 8}")
         else:
-            self._settings_window.minsize(int(960 * self.ui_scale), int(680 * self.ui_scale))
-            try:
-                self._settings_window.state("zoomed")
-            except Exception:
-                width = int(self.winfo_screenwidth() * 0.92)
-                height = int(self.winfo_screenheight() * 0.9)
-                self._settings_window.geometry(f"{width}x{height}+30+30")
+            self._settings_window.minsize(int(900 * self.ui_scale), int(640 * self.ui_scale))
+            width = int(self.winfo_screenwidth() * 0.56)
+            height = int(self.winfo_screenheight() * 0.72)
+            self._settings_window.geometry(f"{width}x{height}+30+30")
 
         outer = ttk.Frame(self._settings_window, style="Card.TFrame", padding=self._pad(16, 16))
-        outer.pack(fill="both", expand=True)
-        canvas = tk.Canvas(outer, highlightthickness=0, bd=0)
-        canvas.configure(bg=self.theme_manager.palette.app_bg)
-        self._settings_canvas = canvas
-        canvas.pack(side="left", fill="both", expand=True)
-        scroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        scroll.pack(side="right", fill="y")
-        canvas.configure(yscrollcommand=scroll.set)
+        outer.grid(row=0, column=0, sticky="nsew")
+        outer.grid_rowconfigure(1, weight=1)
+        outer.grid_columnconfigure(0, weight=1)
+        self._settings_hint_labels = []
 
-        inner = ttk.Frame(canvas, style="App.TFrame")
-        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window_id, width=e.width))
-        self._bind_mousewheel_to_canvas(canvas)
-        inner.grid_columnconfigure(0, weight=1)
-        inner.grid_columnconfigure(1, weight=1)
-
-        hero = ttk.Frame(inner, style="Card.TFrame", padding=self._pad(12, 8))
-        hero.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, self._pad_y(10)))
+        hero = ttk.Frame(outer, style="Card.TFrame", padding=self._pad(12, 8))
+        hero.grid(row=0, column=0, sticky="ew", pady=(0, self._pad_y(10)))
         hero.grid_columnconfigure(0, weight=1)
-        hero.grid_columnconfigure(1, weight=0)
         self.settings_title_label = ttk.Label(hero, text="⚙ Параметры подключения и оформления", style="CardTitle.TLabel")
         self.settings_title_label.configure(font=("Segoe UI Semibold", max(15, int(17 * self.ui_scale))))
         self.settings_title_label.grid(row=0, column=0, sticky="w")
@@ -748,18 +736,23 @@ class LabForgeApp(tk.Tk):
             hero,
             text="Здесь можно выбрать порты, проверить устройства, настроить связь и внешний вид программы.",
             style="CardText.TLabel",
-            wraplength=int(900 * self.ui_scale),
+            wraplength=int(980 * self.ui_scale),
+            justify="left",
         )
         self.settings_intro_label.configure(font=("Segoe UI", max(11, int(12 * self.ui_scale))))
-        self.settings_intro_label.grid(row=1, column=0, sticky="w", pady=(0, 0))
+        self.settings_intro_label.grid(row=1, column=0, sticky="w")
+
         hero_controls = ttk.Frame(hero, style="Card.TFrame")
-        hero_controls.grid(row=0, column=1, rowspan=2, sticky="ne", padx=(self._pad_x(10), 0))
+        hero_controls.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(self._pad_y(8), 0))
         for idx in range(3):
             hero_controls.grid_columnconfigure(idx, weight=1)
-        self.settings_reset_button = ttk.Button(hero_controls, text="Сброс по умолчанию", style="Soft.TButton", command=self.reset_default_settings, width=18)
+        self.settings_reset_button = ttk.Button(hero_controls, text="Сброс по умолчанию", style="SettingsSoft.TButton", command=self.reset_default_settings, width=18)
         self.settings_reset_button.grid(row=0, column=0, sticky="ew", padx=(0, self._pad_x(6)))
-        self.settings_save_button = ttk.Button(hero_controls, text="Сохранить", style="Accent.TButton", command=self.save_settings, width=18)
+        self.settings_save_button = ttk.Button(hero_controls, text="Сохранить", style="SettingsAccent.TButton", command=self.save_settings, width=18)
         self.settings_save_button.grid(row=0, column=1, sticky="ew", padx=self._pad_pair(3))
+        self.settings_exit_button = ttk.Button(hero_controls, text="Выход", style="SettingsSoft.TButton", command=self._close_settings_window, width=18)
+        self.settings_exit_button.grid(row=0, column=2, sticky="ew", padx=(self._pad_x(6), 0))
+
         self.autosave_checkbox = ttk.Checkbutton(
             hero_controls,
             text="Автосохранение",
@@ -784,8 +777,6 @@ class LabForgeApp(tk.Tk):
             bd=1,
             relief="solid",
         )
-        self.settings_exit_button = ttk.Button(hero_controls, text="Выход", style="Soft.TButton", command=self._close_settings_window, width=18)
-        self.settings_exit_button.grid(row=0, column=2, sticky="ew", padx=(self._pad_x(6), 0))
         self.settings_mode_badge.grid(row=1, column=2, sticky="ew", pady=(self._pad_y(8), 0))
         self.settings_mode_hint = ttk.Label(
             hero_controls,
@@ -795,68 +786,125 @@ class LabForgeApp(tk.Tk):
             justify="left",
         )
         self.settings_mode_hint.configure(font=("Segoe UI", max(10, int(11 * self.ui_scale))))
-        self.settings_mode_hint.grid(row=3, column=1, columnspan=2, sticky="w", pady=(self._pad_y(4), 0))
-        devices_frame = ttk.LabelFrame(inner, text="Устройства", style="Section.TLabelframe", padding=self._pad(12, 10))
-        devices_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, self._pad_y(10)))
-        devices_frame.grid_columnconfigure(1, weight=1)
-        devices_frame.grid_columnconfigure(2, weight=1)
+        self.settings_mode_hint.grid(row=2, column=0, columnspan=3, sticky="w", pady=(self._pad_y(6), 0))
+
+        self._settings_tab_canvases = []
+        notebook = ttk.Notebook(outer)
+        notebook.grid(row=1, column=0, sticky="nsew")
+
+        devices_tab, devices_body = self._create_settings_scroll_tab(notebook)
+        scales_tab, scales_body = self._create_settings_scroll_tab(notebook)
+        furnace_tab, furnace_body = self._create_settings_scroll_tab(notebook)
+        app_tab, app_body = self._create_settings_scroll_tab(notebook)
+        ui_tab, ui_body = self._create_settings_scroll_tab(notebook)
+
+        notebook.add(devices_tab, text="Устройства")
+        notebook.add(scales_tab, text="Весы")
+        notebook.add(furnace_tab, text="Печь")
+        notebook.add(app_tab, text="Приложение")
+        notebook.add(ui_tab, text="Интерфейс")
+
+        devices_frame = ttk.LabelFrame(devices_body, text="Устройства", style="Section.TLabelframe", padding=self._pad(12, 10))
+        devices_frame.grid(row=0, column=0, sticky="nsew")
+        devices_frame.grid_columnconfigure(1, weight=3, minsize=int(520 * self.ui_scale))
+        devices_frame.grid_columnconfigure(2, weight=2, minsize=int(540 * self.ui_scale))
 
         ttk.Label(devices_frame, text="Порт весов", style="CardText.TLabel").grid(row=0, column=0, sticky="w", padx=(0, self._pad_x(12)), pady=(self._pad_y(6), self._pad_y(6)))
         self.settings_scale_combo = ttk.Combobox(devices_frame, textvariable=self.scale_port_display_var, width=96)
         self.settings_scale_combo.configure(font=("Segoe UI", max(11, int(12 * self.ui_scale))))
         self.settings_scale_combo.grid(row=0, column=1, sticky="ew", pady=(self._pad_y(6), self._pad_y(6)))
-        ttk.Label(
+        self._make_settings_note_label(
             devices_frame,
-            text="Формат списка: COM-порт - имя интерфейса в системе - тип устройства. Можно ввести вручную.",
-            style="CardText.TLabel",
-            wraplength=int(330 * self.ui_scale),
-        ).grid(row=0, column=2, sticky="w", padx=(self._pad_x(12), 0))
+            "Формат списка: COM-порт - имя интерфейса в системе - тип устройства. Можно ввести вручную.",
+            wraplength=int(640 * self.ui_scale),
+        ).grid(row=0, column=2, sticky="nsew", padx=(self._pad_x(12), 0))
 
         ttk.Label(devices_frame, text="Порт печи", style="CardText.TLabel").grid(row=1, column=0, sticky="w", padx=(0, self._pad_x(12)), pady=(self._pad_y(6), self._pad_y(6)))
         self.settings_furnace_combo = ttk.Combobox(devices_frame, textvariable=self.furnace_port_display_var, width=96)
         self.settings_furnace_combo.configure(font=("Segoe UI", max(11, int(12 * self.ui_scale))))
         self.settings_furnace_combo.grid(row=1, column=1, sticky="ew", pady=(self._pad_y(6), self._pad_y(6)))
-        ttk.Label(
+        self._make_settings_note_label(
             devices_frame,
-            text="Для печи обычно выбирается USB-RS485 адаптер. Проверку лучше делать после уточнения slave ID и регистров.",
-            style="CardText.TLabel",
-            wraplength=int(330 * self.ui_scale),
-        ).grid(row=1, column=2, sticky="w", padx=(self._pad_x(12), 0))
+            "Для печи обычно выбирается USB-RS485 адаптер. Проверку лучше делать после уточнения slave ID и регистров.",
+            wraplength=int(640 * self.ui_scale),
+        ).grid(row=1, column=2, sticky="nsew", padx=(self._pad_x(12), 0))
 
         device_buttons = ttk.Frame(devices_frame, style="Card.TFrame")
         device_buttons.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(self._pad_y(8), 0))
         for idx in range(4):
             device_buttons.grid_columnconfigure(idx, weight=1)
-        ttk.Button(device_buttons, text="Обновить порты", style="Soft.TButton", command=self.refresh_ports).grid(row=0, column=0, sticky="ew", padx=(0, self._pad_x(6)))
-        ttk.Button(device_buttons, text="Проверить весы", style="Soft.TButton", command=self.probe_scale_device).grid(row=0, column=1, sticky="ew", padx=self._pad_pair(3))
-        ttk.Button(device_buttons, text="Проверить печь", style="Soft.TButton", command=self.probe_furnace_device).grid(row=0, column=2, sticky="ew", padx=self._pad_pair(3))
-        ttk.Button(device_buttons, text="Применить порты", style="Accent.TButton", command=self.save_settings).grid(row=0, column=3, sticky="ew", padx=(self._pad_x(6), 0))
-        ttk.Label(devices_frame, textvariable=self.device_check_var, style="CardText.TLabel", wraplength=int(640 * self.ui_scale)).grid(
+        ttk.Button(device_buttons, text="Обновить порты", style="SettingsSoft.TButton", command=self.refresh_ports).grid(row=0, column=0, sticky="ew", padx=(0, self._pad_x(6)))
+        ttk.Button(device_buttons, text="Проверить весы", style="SettingsSoft.TButton", command=self.probe_scale_device).grid(row=0, column=1, sticky="ew", padx=self._pad_pair(3))
+        ttk.Button(device_buttons, text="Проверить печь", style="SettingsSoft.TButton", command=self.probe_furnace_device).grid(row=0, column=2, sticky="ew", padx=self._pad_pair(3))
+        ttk.Button(device_buttons, text="Применить порты", style="SettingsAccent.TButton", command=self.save_settings).grid(row=0, column=3, sticky="ew", padx=(self._pad_x(6), 0))
+        ttk.Label(devices_frame, textvariable=self.device_check_var, style="CardText.TLabel", wraplength=int(840 * self.ui_scale), justify="left").grid(
             row=3,
             column=0,
             columnspan=3,
             sticky="w",
             pady=(self._pad_y(10), 0),
         )
+        self._make_settings_note_label(
+            devices_frame,
+            "Драйвер для Adam Highland HCB: HCB Highland USB Driver 64 Bit.\n"
+            "Страница загрузки: https://adamequipment.co.uk/support/software-downloads.html",
+            wraplength=int(980 * self.ui_scale),
+        ).grid(row=4, column=0, columnspan=3, sticky="ew", pady=(self._pad_y(10), 0))
+        ttk.Button(
+            devices_frame,
+            text="Открыть страницу драйвера Adam",
+            style="SettingsSoft.TButton",
+            command=lambda: webbrowser.open("https://adamequipment.co.uk/support/software-downloads.html"),
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(self._pad_y(8), 0))
+        self._make_settings_note_label(
+            devices_frame,
+            "Быстрая настройка весов Adam для живого графика:\n"
+            "1. Во время самотестирования нажмите [Mode].\n"
+            "2. Дойдите до меню F3 SEr.\n"
+            "3. Выберите интерфейс S USB.\n"
+            "4. Выберите режим P2 Con для непрерывной передачи.\n"
+            "5. Установите скорость b 9600.\n"
+            "6. Установите формат 8n1.\n"
+            "7. Установите формат For2.\n"
+            "8. Вернитесь в режим взвешивания кнопкой [Print].\n"
+            "9. В программе используйте continuous. Если поток нестабилен, включите P1 Prt и опрос командой P.",
+            wraplength=int(980 * self.ui_scale),
+        ).grid(row=6, column=0, columnspan=3, sticky="ew", pady=(self._pad_y(10), 0))
 
         self._sync_port_display_vars()
         values = [self._settings_port_label(port) for port in self.available_ports]
         self.settings_scale_combo.configure(values=values)
         self.settings_furnace_combo.configure(values=values)
 
-        section_positions = {
-            "Весы": (2, 0),
-            "Печь": (2, 1),
-            "Приложение": (3, 0),
-            "Интерфейс и файлы": (3, 1),
+        tab_parent_map = {
+            "Весы": scales_body,
+            "Печь": furnace_body,
+            "Приложение": app_body,
+            "Интерфейс и файлы": ui_body,
         }
 
+        font_controls_frame = ttk.LabelFrame(ui_body, text="Размер шрифта", style="Section.TLabelframe", padding=self._pad(12, 10))
+        font_controls_frame.grid(row=0, column=0, sticky="ew", pady=(0, self._pad_y(10)))
+        for idx in range(5):
+            font_controls_frame.grid_columnconfigure(idx, weight=1 if idx in {1, 3} else 0)
+        ttk.Label(font_controls_frame, text="Масштаб интерфейса", style="CardText.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Button(font_controls_frame, text="-", style="SettingsSoft.TButton", command=lambda: self.adjust_font_scale(-0.05), width=4).grid(row=0, column=1, padx=(self._pad_x(10), self._pad_x(6)))
+        self.settings_font_scale_value_label = ttk.Label(font_controls_frame, text="", style="CardTitle.TLabel", anchor="center")
+        self.settings_font_scale_value_label.grid(row=0, column=2, padx=(0, self._pad_x(6)))
+        ttk.Button(font_controls_frame, text="+", style="SettingsSoft.TButton", command=lambda: self.adjust_font_scale(0.05), width=4).grid(row=0, column=3, padx=(0, self._pad_x(6)))
+        ttk.Button(font_controls_frame, text="Сброс", style="SettingsSoft.TButton", command=self.reset_font_scale).grid(row=0, column=4)
+        self._make_settings_note_label(
+            font_controls_frame,
+            "Этот блок дублирует управление размером шрифта из главного окна. Изменение применяется ко всей программе.",
+            wraplength=int(820 * self.ui_scale),
+        ).grid(row=1, column=0, columnspan=5, sticky="ew", pady=(self._pad_y(8), 0))
+
         for section_title, fields in SETTINGS_SECTIONS:
-            row, column = section_positions.get(section_title, (3, 1))
-            frame = ttk.LabelFrame(inner, text=section_title, style="Section.TLabelframe", padding=self._pad(12, 10))
-            frame.grid(row=row, column=column, sticky="nsew", pady=(0, self._pad_y(10)), padx=(0, self._pad_x(8)) if column == 0 else (self._pad_x(8), 0))
+            tab_parent = tab_parent_map.get(section_title, app_tab)
+            frame = ttk.LabelFrame(tab_parent, text=section_title, style="Section.TLabelframe", padding=self._pad(12, 10))
+            frame.grid(row=1 if tab_parent is ui_body else 0, column=0, sticky="nsew")
             frame.grid_columnconfigure(1, weight=1)
-            frame.grid_columnconfigure(2, weight=1)
+            frame.grid_columnconfigure(2, weight=0, minsize=int(360 * self.ui_scale))
             self._build_settings_section(frame, fields)
 
         self._apply_theme_to_toplevel(self._settings_window)
@@ -867,8 +915,9 @@ class LabForgeApp(tk.Tk):
     def _build_settings_section(self, parent, fields) -> None:
         parent.grid_columnconfigure(0, weight=0, minsize=int(210 * self.ui_scale))
         parent.grid_columnconfigure(1, weight=1, minsize=int(210 * self.ui_scale))
-        parent.grid_columnconfigure(2, weight=1, minsize=int(260 * self.ui_scale))
+        parent.grid_columnconfigure(2, weight=0, minsize=int(360 * self.ui_scale))
         for row, (key, label, kind, tooltip, choices) in enumerate(fields):
+            parent.grid_rowconfigure(row, weight=0)
             tooltip_text = self._build_setting_tooltip(key, tooltip)
             label_widget = ttk.Label(parent, text=label, style="CardText.TLabel")
             label_widget.configure(font=("Segoe UI", max(11, int(12 * self.ui_scale))))
@@ -888,12 +937,15 @@ class LabForgeApp(tk.Tk):
             if kind == "bool":
                 widget.configure(style="Card.TCheckbutton")
             widget.grid(row=row, column=1, sticky="ew", pady=(self._pad_y(4), self._pad_y(4)))
-            hint_label = ttk.Label(parent, text=f"{tooltip} По умолчанию: {DEFAULTS[key]}", style="CardAltText.TLabel", wraplength=int(420 * self.ui_scale))
-            hint_label.configure(font=("Segoe UI", max(11, int(12 * self.ui_scale))))
+            hint_label = self._make_settings_note_label(
+                parent,
+                f"{tooltip} По умолчанию: {DEFAULTS[key]}",
+                wraplength=int(360 * self.ui_scale),
+            )
             hint_label.grid(
                 row=row,
                 column=2,
-                sticky="w",
+                sticky="nsew",
                 padx=(self._pad_x(10), 0),
                 pady=(self._pad_y(4), self._pad_y(4)),
             )
@@ -1196,6 +1248,8 @@ class LabForgeApp(tk.Tk):
             self._update_settings_control_states()
         if hasattr(self, "font_scale_value_label") and self.font_scale_value_label.winfo_exists():
             self.font_scale_value_label.configure(text=f"{int(round(self.config_data.app.font_scale * 100))}%")
+        if hasattr(self, "settings_font_scale_value_label") and self.settings_font_scale_value_label.winfo_exists():
+            self.settings_font_scale_value_label.configure(text=f"{int(round(self.config_data.app.font_scale * 100))}%")
         for card in (self.mass_card, self.temp_card, self.status_card, self.time_card):
             card.apply_theme(palette, self.ui_scale)
         self._style_indicator(self.scale_indicator, palette)
@@ -1218,13 +1272,102 @@ class LabForgeApp(tk.Tk):
     def _apply_theme_to_toplevel(self, window: tk.Toplevel, *, text_widget: ScrolledText | None = None) -> None:
         palette = self.theme_manager.palette
         window.configure(bg=palette.app_bg)
-        if hasattr(self, "_settings_canvas"):
+        for canvas in getattr(self, "_settings_tab_canvases", []):
             try:
-                self._settings_canvas.configure(bg=palette.app_bg)
+                canvas.configure(bg=palette.app_bg)
             except Exception:
-                pass
+                continue
+        for label in getattr(self, "_settings_hint_labels", []):
+            try:
+                wraplength = getattr(label, "_datafusion_wraplength", int(360 * self.ui_scale))
+                label.configure(
+                    bg=palette.card_alt_bg,
+                    fg=palette.subtext,
+                    font=("Segoe UI", max(11, int(12 * self.ui_scale))),
+                    wraplength=wraplength,
+                )
+            except Exception:
+                continue
         if text_widget is not None:
             text_widget.configure(background=palette.input_bg, foreground=palette.text, insertbackground=palette.text, font=("Segoe UI", max(12, int(13 * self.ui_scale))))
+
+    def _make_settings_note_label(self, parent, text: str, *, wraplength: int) -> tk.Label:
+        palette = self.theme_manager.palette
+        label = tk.Label(
+            parent,
+            text=text,
+            bg=palette.card_alt_bg,
+            fg=palette.subtext,
+            justify="left",
+            anchor="nw",
+            wraplength=wraplength,
+            padx=self._pad_x(8),
+            pady=self._pad_y(6),
+            font=("Segoe UI", max(11, int(12 * self.ui_scale))),
+            borderwidth=0,
+            highlightthickness=0,
+        )
+        label._datafusion_wraplength = wraplength  # type: ignore[attr-defined]
+        self._settings_hint_labels.append(label)
+        return label
+
+    def _create_settings_scroll_tab(self, notebook: ttk.Notebook) -> tuple[ttk.Frame, ttk.Frame]:
+        tab = ttk.Frame(notebook, style="App.TFrame")
+        tab.grid_rowconfigure(0, weight=1)
+        tab.grid_columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(tab, highlightthickness=0, bd=0, background=self.theme_manager.palette.app_bg)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        body = ttk.Frame(canvas, style="App.TFrame", padding=self._pad(8, 8))
+        window_id = canvas.create_window((0, 0), window=body, anchor="nw")
+        body.grid_columnconfigure(0, weight=1)
+
+        def refresh(_event=None) -> None:
+            try:
+                canvas.itemconfigure(window_id, width=max(1, canvas.winfo_width() - 2))
+                bbox = canvas.bbox("all")
+                if bbox:
+                    canvas.configure(scrollregion=bbox)
+                if body.winfo_reqheight() > canvas.winfo_height() + 4:
+                    scrollbar.grid()
+                else:
+                    scrollbar.grid_remove()
+            except tk.TclError:
+                return
+
+        body.bind("<Configure>", lambda e: self.after_idle(refresh), add="+")
+        canvas.bind("<Configure>", lambda e: self.after_idle(refresh), add="+")
+        self._bind_mousewheel_to_canvas(canvas)
+        self._settings_tab_canvases.append(canvas)
+        self.after_idle(refresh)
+        return tab, body
+
+    def _schedule_settings_layout_update(self, _event=None) -> None:
+        if getattr(self, "_settings_layout_after_id", None):
+            return
+        try:
+            self._settings_layout_after_id = self.after_idle(self._update_settings_canvas_layout)
+        except Exception:
+            self._settings_layout_after_id = None
+
+    def _update_settings_canvas_layout(self) -> None:
+        self._settings_layout_after_id = None
+        canvas = getattr(self, "_settings_canvas", None)
+        if canvas is None or not canvas.winfo_exists():
+            return
+        try:
+            window_id = getattr(self, "_settings_canvas_window_id", None)
+            if window_id is not None:
+                canvas.itemconfigure(window_id, width=max(1, canvas.winfo_width() - 2))
+            bbox = canvas.bbox("all")
+            if bbox:
+                canvas.configure(scrollregion=bbox)
+        except tk.TclError:
+            return
 
     def _style_menu_button(self, button: tk.Menubutton, palette: ThemePalette) -> None:
         button.configure(
@@ -1276,7 +1419,7 @@ class LabForgeApp(tk.Tk):
             top, bottom = canvas.yview()
             span = max(0.0, bottom - top)
             max_top = max(0.0, 1.0 - span)
-            step = 0.035
+            step = 0.022
             new_top = min(max_top, max(0.0, top + (step * delta)))
             canvas.yview_moveto(new_top)
         except tk.TclError:
@@ -1362,6 +1505,46 @@ class LabForgeApp(tk.Tk):
             window.destroy()
         except Exception:
             return
+
+    def _toggle_settings_window_maximize(self) -> None:
+        window = getattr(self, "_settings_window", None)
+        if window is None or not window.winfo_exists():
+            return
+
+        zoomed = bool(getattr(window, "_datafusion_zoomed", False))
+        if zoomed:
+            area = _windows_work_area()
+            if area is not None:
+                x, y, width, height = area
+                width = max(int(width * 0.9), 920)
+                height = max(int(height * 0.88), 680)
+                pos_x = x + max(8, (area[2] - width) // 2)
+                pos_y = y + max(8, (area[3] - height) // 2)
+                window.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
+            else:
+                window.state("normal")
+            window._datafusion_zoomed = False  # type: ignore[attr-defined]
+        else:
+            area = _windows_work_area()
+            if area is not None:
+                x, y, width, height = area
+                window.geometry(f"{max(640, width - 16)}x{max(480, height - 16)}+{x + 8}+{y + 8}")
+            else:
+                try:
+                    window.state("zoomed")
+                except Exception:
+                    window.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
+            window._datafusion_zoomed = True  # type: ignore[attr-defined]
+
+        self._update_settings_zoom_button()
+
+    def _update_settings_zoom_button(self) -> None:
+        button = getattr(self, "settings_zoom_button", None)
+        window = getattr(self, "_settings_window", None)
+        if button is None or window is None or not button.winfo_exists():
+            return
+        zoomed = bool(getattr(window, "_datafusion_zoomed", False))
+        button.configure(text="❐" if zoomed else "▢")
 
     def _poll_runtime_queues(self) -> None:
         for snapshot in self.controller.drain_snapshots():
@@ -1886,6 +2069,8 @@ class LabForgeApp(tk.Tk):
         self._apply_theme()
         if hasattr(self, "font_scale_value_label") and self.font_scale_value_label.winfo_exists():
             self.font_scale_value_label.configure(text=f"{int(round(rounded * 100))}%")
+        if hasattr(self, "settings_font_scale_value_label") and self.settings_font_scale_value_label.winfo_exists():
+            self.settings_font_scale_value_label.configure(text=f"{int(round(rounded * 100))}%")
         if bool(self.autosave_settings_var.get()):
             save_config(self.config_data, self.config_path)
         self._set_status(f"Размер шрифта: {int(round(rounded * 100))}%.", emit_log=False)

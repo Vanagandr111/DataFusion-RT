@@ -239,6 +239,90 @@ class ThemeManager:
             bordercolor=[("active", palette.accent), ("disabled", palette.border)],
         )
         style.configure(
+            "SettingsAccent.TButton",
+            font=("Segoe UI Semibold", size(12)),
+            padding=(size(16), size(11)),
+            background=palette.accent,
+            foreground="#081016" if palette.name == "dark" else "#FFFFFF",
+            borderwidth=0,
+        )
+        style.map(
+            "SettingsAccent.TButton",
+            background=[("active", "#55E2CF" if palette.name == "dark" else "#0B8A80"), ("disabled", palette.accent_dim)],
+            foreground=[("disabled", palette.disabled)],
+        )
+        style.configure(
+            "SettingsSoft.TButton",
+            font=("Segoe UI Semibold", size(12)),
+            padding=(size(16), size(11)),
+            background=palette.button_soft_bg,
+            foreground=palette.text,
+            bordercolor=palette.border,
+        )
+        style.map(
+            "SettingsSoft.TButton",
+            background=[("active", palette.button_soft_active), ("disabled", palette.button_soft_bg)],
+            foreground=[("disabled", palette.disabled)],
+            bordercolor=[("active", palette.accent), ("disabled", palette.border)],
+        )
+        style.configure(
+            "WindowIcon.TButton",
+            font=("Segoe UI Symbol", size(11)),
+            padding=(size(8), size(7)),
+            background=palette.button_soft_bg,
+            foreground=palette.text,
+            bordercolor=palette.border,
+        )
+        style.map(
+            "WindowIcon.TButton",
+            background=[("active", palette.button_soft_active), ("disabled", palette.button_soft_bg)],
+            foreground=[("disabled", palette.disabled)],
+            bordercolor=[("active", palette.accent), ("disabled", palette.border)],
+        )
+        style.configure(
+            "TNotebook",
+            background=palette.app_bg,
+            borderwidth=0,
+            tabmargins=(size(4), size(4), size(4), 0),
+        )
+        style.configure(
+            "TNotebook.Tab",
+            background=palette.button_soft_bg,
+            foreground=palette.text,
+            bordercolor=palette.border,
+            lightcolor=palette.border,
+            darkcolor=palette.border,
+            padding=(size(18), size(10)),
+            font=("Segoe UI Semibold", size(12)),
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[
+                ("selected", palette.accent if palette.name == "dark" else "#DCEFEB"),
+                ("active", palette.button_soft_active),
+            ],
+            foreground=[
+                ("selected", "#081016" if palette.name == "dark" else "#0F3F3A"),
+                ("active", palette.text),
+            ],
+            padding=[
+                ("selected", (size(18), size(10))),
+                ("active", (size(18), size(10))),
+            ],
+            bordercolor=[
+                ("selected", palette.accent),
+                ("active", palette.accent),
+            ],
+            lightcolor=[
+                ("selected", palette.accent),
+                ("active", palette.border),
+            ],
+            darkcolor=[
+                ("selected", palette.accent),
+                ("active", palette.border),
+            ],
+        )
+        style.configure(
             "Card.TCheckbutton",
             background=palette.card_bg,
             foreground=palette.text,

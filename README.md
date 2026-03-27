@@ -176,6 +176,31 @@ scripts\build_exe.bat
 
 После сборки рядом с `.exe` должен лежать `config/config.yaml`.
 
+Готовая Windows-сборка попадает в:
+
+- `dist/DataFusion-RT/DataFusion-RT.exe`
+
+## Сборка для Linux
+
+Linux-сборка делается отдельно и должна собираться именно на Linux-машине или в Linux CI. PyInstaller не делает надёжный Linux-бинарь из Windows.
+
+Что нужно на Linux:
+
+1. Установить системные зависимости `python3`, `python3-venv`, `python3-tk` и библиотеки для `tkinter`/`matplotlib`.
+2. Создать `.venv` и установить `requirements.txt`.
+3. Запустить:
+
+```bash
+chmod +x scripts/build_linux.sh
+scripts/build_linux.sh
+```
+
+Результат сборки:
+
+- `dist-linux/DataFusion-RT/DataFusion-RT`
+
+Это автономная папка PyInstaller. На целевой Linux-машине Python отдельно не нужен, но обычно должна совпадать семейство/версия glibc или дистрибутива с той системой, на которой сборка была сделана.
+
 ## Типовые проблемы
 
 ### COM-порт не найден
