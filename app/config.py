@@ -48,10 +48,12 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
         scale=ScaleConfig(
             enabled=bool(scale_raw.get("enabled", True)),
             port=str(scale_raw.get("port", "COM3")),
-            baudrate=int(scale_raw.get("baudrate", 4800)),
+            baudrate=int(scale_raw.get("baudrate", 9600)),
             timeout=float(scale_raw.get("timeout", 1.0)),
-            mode=str(scale_raw.get("mode", "auto")).strip().lower(),
+            mode=str(scale_raw.get("mode", "continuous")).strip().lower(),
             request_command=str(scale_raw.get("request_command", "P\r\n")),
+            p1_polling_enabled=bool(scale_raw.get("p1_polling_enabled", False)),
+            p1_poll_interval_sec=float(scale_raw.get("p1_poll_interval_sec", 0.1)),
         ),
         furnace=FurnaceConfig(
             enabled=bool(furnace_raw.get("enabled", True)),
@@ -110,6 +112,8 @@ def config_to_dict(config: AppConfig) -> dict[str, dict[str, object]]:
             "timeout": config.scale.timeout,
             "mode": config.scale.mode,
             "request_command": config.scale.request_command,
+            "p1_polling_enabled": config.scale.p1_polling_enabled,
+            "p1_poll_interval_sec": config.scale.p1_poll_interval_sec,
         },
         "furnace": {
             "enabled": config.furnace.enabled,

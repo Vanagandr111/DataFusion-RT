@@ -7,7 +7,7 @@ import time
 import serial
 
 from app.models import ScaleConfig
-from app.utils.parsers import parse_mass_line
+from app.utils.parsers import parse_mass_line, sanitize_ascii_line
 
 
 class ScaleReader:
@@ -23,6 +23,9 @@ class ScaleReader:
         self._serial: serial.Serial | None = None
         self._test_started = time.monotonic()
         self._next_connect_attempt_at = 0.0
+        self._unparsed_line_count = 0
+        self._last_polled_mass: float | None = None
+        self._last_poll_at = 0.0
 
         if self.config.enabled and not self.test_mode:
             self.connect()
@@ -44,6 +47,7 @@ class ScaleReader:
                 write_timeout=self.config.timeout,
             )
             self._next_connect_attempt_at = 0.0
+            self._unparsed_line_count = 0
             self.logger.info("Подключение к весам открыто на %s", self.config.port)
             return True
         except serial.SerialException as exc:
@@ -68,6 +72,8 @@ class ScaleReader:
         mode = self.config.mode.lower()
 
         try:
+            if self.config.p1_polling_enabled:
+                return self._poll_mass_rate_limited()
             if mode == "continuous":
                 return self._read_from_stream()
             if mode == "poll":
@@ -95,10 +101,10 @@ class ScaleReader:
         return self._serial is not None and self._serial.is_open
 
     def tare(self) -> bool:
-        return self.send_command("T\r\n")
+        return self._send_verified_zeroing("T\r\n", action_name="тары")
 
     def zero(self) -> bool:
-        return self.send_command("Z\r\n")
+        return self._send_verified_zeroing("Z\r\n", action_name="обнуления")
 
     def send_command(self, command: str) -> bool:
         if not self.config.enabled:
@@ -122,6 +128,35 @@ class ScaleReader:
             self.close()
             self._next_connect_attempt_at = time.monotonic() + 5.0
             return False
+
+    def _send_verified_zeroing(self, command: str, *, action_name: str) -> bool:
+        if not self.config.enabled:
+            return False
+
+        last_mass: float | None = None
+        for attempt in range(1, 3):
+            if not self.send_command(command):
+                return False
+            if self.test_mode:
+                return True
+            time.sleep(min(0.45, max(0.18, self.config.timeout)))
+            last_mass = self.read_mass()
+            if last_mass is not None and abs(last_mass) <= 0.005:
+                self.logger.info("Команда %s подтверждена после попытки %s.", action_name, attempt)
+                return True
+            if attempt == 1:
+                self.logger.warning(
+                    "После команды %s масса ещё не нулевая (%s). Повторяем один раз.",
+                    action_name,
+                    last_mass,
+                )
+
+        self.logger.warning(
+            "Команда %s отправлена дважды, но масса осталась ненулевой: %s",
+            action_name,
+            last_mass,
+        )
+        return False
 
     def close(self) -> None:
         if self._serial is not None:
@@ -151,9 +186,12 @@ class ScaleReader:
             raw_line = self._read_line(timeout_override=read_timeout)
             if not raw_line:
                 continue
-            mass = parse_mass_line(raw_line, logger=self.logger)
+            mass = parse_mass_line(raw_line)
             if mass is not None:
+                self._unparsed_line_count = 0
                 latest_mass = mass
+            else:
+                self._log_unparsed_line(raw_line)
 
         return latest_mass
 
@@ -174,15 +212,26 @@ class ScaleReader:
             raw_line = self._read_line(timeout_override=response_timeout)
             if not raw_line:
                 continue
-            mass = parse_mass_line(raw_line, logger=self.logger)
+            mass = parse_mass_line(raw_line)
             if mass is not None:
+                self._unparsed_line_count = 0
+                self._last_polled_mass = mass
+                self._last_poll_at = time.monotonic()
                 return mass
+            self._log_unparsed_line(raw_line)
 
         self.logger.warning(
             "Весы не вернули распознаваемый ответ после команды %r",
             self.config.request_command,
         )
         return None
+
+    def _poll_mass_rate_limited(self) -> float | None:
+        now = time.monotonic()
+        interval = max(0.02, float(self.config.p1_poll_interval_sec))
+        if self._last_poll_at and (now - self._last_poll_at) < interval:
+            return self._last_polled_mass
+        return self._poll_mass()
 
     def _read_line(self, timeout_override: float | None = None) -> str | None:
         if self._serial is None:
@@ -205,3 +254,25 @@ class ScaleReader:
         if text:
             self.logger.debug("Сырые данные весов: %r", text)
         return text or None
+
+    def _log_unparsed_line(self, raw_line: str) -> None:
+        self._unparsed_line_count += 1
+        cleaned = sanitize_ascii_line(raw_line).upper()
+        status_like = (
+            cleaned in {"+", "-", "G", "KG", "MG", "OZ", "LB", "LBS"}
+            or cleaned.endswith(" LLLLLL G")
+            or cleaned == "LLLLLL G"
+            or "LLLLLL" in cleaned
+        )
+        if status_like:
+            message = "Статусная строка весов #%s: %r"
+            if self._unparsed_line_count <= 5 or self._unparsed_line_count % 20 == 0:
+                self.logger.info(message, self._unparsed_line_count, raw_line)
+            else:
+                self.logger.debug(message, self._unparsed_line_count, raw_line)
+        else:
+            message = "Не удалось распознать строку веса #%s: %r"
+            if self._unparsed_line_count <= 5 or self._unparsed_line_count % 20 == 0:
+                self.logger.warning(message, self._unparsed_line_count, raw_line)
+            else:
+                self.logger.debug(message, self._unparsed_line_count, raw_line)

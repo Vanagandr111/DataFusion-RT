@@ -49,6 +49,10 @@ data/*
 logs/*
 !logs/.gitkeep
 
+# Local driver packages
+driver/
+drivers/
+
 # Generated measurements / exports
 *.csv
 *.xlsx

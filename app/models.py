@@ -11,6 +11,8 @@ class ScaleConfig:
     timeout: float
     mode: str
     request_command: str
+    p1_polling_enabled: bool = False
+    p1_poll_interval_sec: float = 0.1
 
 
 @dataclass(slots=True)

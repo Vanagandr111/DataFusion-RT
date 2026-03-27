@@ -1,15 +1,17 @@
 scale:
   enabled: true
-  port: COM3
-  baudrate: 4800
+  port: COM7
+  baudrate: 9600
   timeout: 1.0
-  mode: auto
+  mode: continuous
   request_command: P
+  p1_polling_enabled: true
+  p1_poll_interval_sec: 0.1
 furnace:
-  enabled: true
+  enabled: false
   port: COM4
   baudrate: 9600
-  bytesize: 8
+  bytesize: 7
   parity: N
   stopbits: 1.0
   timeout: 1.0
@@ -23,7 +25,7 @@ app:
   log_path: logs/app.log
   max_points_on_plot: 500
   test_mode: false
-  autosave_settings: false
+  autosave_settings: true
   enable_file_logging: false
   theme: dark
   start_maximized: true

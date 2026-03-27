@@ -341,8 +341,8 @@ class ThemeManager:
             darkcolor=palette.border,
             arrowcolor=palette.text,
             gripcount=0,
-            arrowsize=size(12),
-            width=size(14),
+            arrowsize=size(14),
+            width=size(18),
             relief="flat",
         )
         style.map(

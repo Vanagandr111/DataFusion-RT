@@ -24,10 +24,12 @@ from app.utils.serial_tools import guess_port_kind, list_available_ports, port_d
 
 DEFAULTS: dict[str, object] = {
     "scale.enabled": True,
-    "scale.baudrate": 4800,
+    "scale.baudrate": 9600,
     "scale.timeout": 1.0,
-    "scale.mode": "auto",
+    "scale.mode": "continuous",
     "scale.request_command": "P\r\n",
+    "scale.p1_polling_enabled": False,
+    "scale.p1_poll_interval_sec": 0.1,
     "furnace.enabled": True,
     "furnace.baudrate": 9600,
     "furnace.bytesize": 8,
@@ -57,10 +59,12 @@ SETTINGS_SECTIONS: list[tuple[str, list[tuple[str, str, str, str, tuple[str, ...
         "Весы",
         [
             ("scale.enabled", "Использовать весы", "bool", "Включает опрос лабораторных весов.", None),
-            ("scale.baudrate", "Скорость связи", "entry", "Обычно 4800 бод для Adam Highland HCB.", None),
+            ("scale.baudrate", "Скорость связи", "entry", "Для ускоренного режима обычно 9600 бод, если весы настроены так же.", None),
             ("scale.timeout", "Таймаут, сек", "entry", "Сколько ждать строку от весов перед повтором.", None),
-            ("scale.mode", "Режим чтения", "combo", "auto: сначала слушать поток, затем опрашивать командой.", ("auto", "continuous", "poll")),
+            ("scale.mode", "Режим чтения", "combo", "Для P2 Con лучше continuous. auto оставляет резервный опрос, если поток пропадёт.", ("auto", "continuous", "poll")),
             ("scale.request_command", "Команда опроса", "entry", "Обычно P\\r\\n. Тара и ноль задаются отдельными кнопками.", None),
+            ("scale.p1_polling_enabled", "Режим P1 Prt", "bool", "Принудительно читать весы по команде P в режиме P1 Prt.", None),
+            ("scale.p1_poll_interval_sec", "Тайминг опроса P1, сек", "entry", "Интервал между командными опросами в P1 Prt. По умолчанию быстрый.", None),
         ],
     ),
     (
@@ -102,10 +106,12 @@ SETTINGS_SECTIONS: list[tuple[str, list[tuple[str, str, str, str, tuple[str, ...
 
 TOOLTIP_DETAILS: dict[str, str] = {
     "scale.enabled": "Отключите этот параметр, если весы физически не подключены, чтобы программа не тратила время на лишние попытки чтения.",
-    "scale.baudrate": "Если весы не отвечают, сначала проверьте именно эту скорость. Для Adam Highland HCB типичный стартовый вариант: 4800 бод.",
+    "scale.baudrate": "Если на весах уже включены P2 Con и For2, удобно использовать 9600 бод. Главное, чтобы скорость в программе совпадала с настройкой самих весов.",
     "scale.timeout": "Слишком маленький таймаут даст ложные ошибки, слишком большой замедлит опрос. Для начала обычно хватает 0.8-1.5 секунды.",
     "scale.mode": "Режим auto обычно самый удобный: программа сначала ждёт поток, а если поток не идёт, отправляет команду опроса сама.",
     "scale.request_command": "Меняйте это поле только если на реальном стенде выяснится, что весы требуют другую ASCII-команду. Обычно достаточно P\\r\\n.",
+    "scale.p1_polling_enabled": "Включайте только если на самих весах выставлен режим P1 Prt. Тогда программа будет опрашивать их по команде, а не ждать непрерывный поток.",
+    "scale.p1_poll_interval_sec": "Если хотите максимально частый опрос в P1 Prt, ставьте маленький интервал вроде 0.1-0.2 секунды. Слишком маленькое значение может только зря грузить COM-порт.",
     "furnace.enabled": "Если печь пока не подключена, можно временно снять галочку. Тогда программа продолжит работать только с весами.",
     "furnace.baudrate": "Если есть связь по USB-RS485, но нет ответа Modbus, проверьте baudrate одним из первых параметров вместе с parity и slave ID.",
     "furnace.bytesize": "У большинства контроллеров используется 8 бит данных. Меняйте только если это явно указано в документации контроллера.",
@@ -142,6 +148,20 @@ def _enable_windows_dpi_awareness() -> None:
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
+
+
+def _windows_work_area() -> tuple[int, int, int, int] | None:
+    try:
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        rect = RECT()
+        SPI_GETWORKAREA = 48
+        if ctypes.windll.user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
+            return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+    except Exception:
+        pass
+    return None
 
 
 class UILogHandler(logging.Handler):
@@ -334,14 +354,24 @@ class LabForgeApp(tk.Tk):
                 return
             except Exception:
                 self.logger.debug("Zoomed window state is not available.", exc_info=True)
-                width = self.winfo_screenwidth()
-                height = self.winfo_screenheight()
-                self.geometry(f"{width}x{height}+0+0")
+                area = _windows_work_area()
+                if area is not None:
+                    x, y, width, height = area
+                    self.geometry(f"{width}x{height}+{x}+{y}")
+                else:
+                    width = self.winfo_screenwidth()
+                    height = self.winfo_screenheight()
+                    self.geometry(f"{width}x{height}+0+0")
                 return
 
-        width = int(self.winfo_screenwidth() * 0.92)
-        height = int(self.winfo_screenheight() * 0.9)
-        self.geometry(f"{width}x{height}+24+24")
+        area = _windows_work_area()
+        if area is not None:
+            x, y, width, height = area
+            self.geometry(f"{int(width * 0.92)}x{int(height * 0.9)}+{x + 24}+{y + 24}")
+        else:
+            width = int(self.winfo_screenwidth() * 0.92)
+            height = int(self.winfo_screenheight() * 0.9)
+            self.geometry(f"{width}x{height}+24+24")
 
     def _init_setting_vars(self) -> None:
         for _section_title, fields in SETTINGS_SECTIONS:
@@ -367,6 +397,8 @@ class LabForgeApp(tk.Tk):
             "scale.timeout": self.config_data.scale.timeout,
             "scale.mode": self.config_data.scale.mode,
             "scale.request_command": self.config_data.scale.request_command,
+            "scale.p1_polling_enabled": self.config_data.scale.p1_polling_enabled,
+            "scale.p1_poll_interval_sec": self.config_data.scale.p1_poll_interval_sec,
             "furnace.enabled": self.config_data.furnace.enabled,
             "furnace.baudrate": self.config_data.furnace.baudrate,
             "furnace.bytesize": self.config_data.furnace.bytesize,
@@ -667,18 +699,25 @@ class LabForgeApp(tk.Tk):
         self._settings_window.title("Настройки")
         self._settings_window.transient(self)
         self._settings_window.grab_set()
-        self._settings_window.protocol("WM_DELETE_WINDOW", lambda: self._fade_out_and_destroy(self._settings_window))
-        self._settings_window.minsize(int(1100 * self.ui_scale), int(760 * self.ui_scale))
-        try:
-            self._settings_window.state("zoomed")
-        except Exception:
-            width = int(self.winfo_screenwidth() * 0.92)
-            height = int(self.winfo_screenheight() * 0.9)
-            self._settings_window.geometry(f"{width}x{height}+30+30")
-        try:
-            self._settings_window.attributes("-alpha", 0.0)
-        except Exception:
-            pass
+        self._settings_window.protocol("WM_DELETE_WINDOW", self._close_settings_window)
+        area = _windows_work_area()
+        if area is not None:
+            x, y, width, height = area
+            min_width = min(max(int(960 * self.ui_scale), 900), max(width - 24, 640))
+            min_height = min(max(int(680 * self.ui_scale), 620), max(height - 24, 480))
+            win_width = max(min_width, width - 16)
+            win_height = max(min_height, height - 16)
+            self._settings_window.minsize(min_width, min_height)
+            self._settings_window.maxsize(width, height)
+            self._settings_window.geometry(f"{win_width}x{win_height}+{x + 8}+{y + 8}")
+        else:
+            self._settings_window.minsize(int(960 * self.ui_scale), int(680 * self.ui_scale))
+            try:
+                self._settings_window.state("zoomed")
+            except Exception:
+                width = int(self.winfo_screenwidth() * 0.92)
+                height = int(self.winfo_screenheight() * 0.9)
+                self._settings_window.geometry(f"{width}x{height}+30+30")
 
         outer = ttk.Frame(self._settings_window, style="Card.TFrame", padding=self._pad(16, 16))
         outer.pack(fill="both", expand=True)
@@ -698,8 +737,8 @@ class LabForgeApp(tk.Tk):
         inner.grid_columnconfigure(0, weight=1)
         inner.grid_columnconfigure(1, weight=1)
 
-        hero = ttk.Frame(inner, style="Card.TFrame", padding=self._pad(12, 10))
-        hero.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, self._pad_y(14)))
+        hero = ttk.Frame(inner, style="Card.TFrame", padding=self._pad(12, 8))
+        hero.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, self._pad_y(10)))
         hero.grid_columnconfigure(0, weight=1)
         hero.grid_columnconfigure(1, weight=0)
         self.settings_title_label = ttk.Label(hero, text="⚙ Параметры подключения и оформления", style="CardTitle.TLabel")
@@ -745,7 +784,7 @@ class LabForgeApp(tk.Tk):
             bd=1,
             relief="solid",
         )
-        self.settings_exit_button = ttk.Button(hero_controls, text="Выход", style="Soft.TButton", command=lambda: self._fade_out_and_destroy(self._settings_window), width=18)
+        self.settings_exit_button = ttk.Button(hero_controls, text="Выход", style="Soft.TButton", command=self._close_settings_window, width=18)
         self.settings_exit_button.grid(row=0, column=2, sticky="ew", padx=(self._pad_x(6), 0))
         self.settings_mode_badge.grid(row=1, column=2, sticky="ew", pady=(self._pad_y(8), 0))
         self.settings_mode_hint = ttk.Label(
@@ -757,8 +796,8 @@ class LabForgeApp(tk.Tk):
         )
         self.settings_mode_hint.configure(font=("Segoe UI", max(10, int(11 * self.ui_scale))))
         self.settings_mode_hint.grid(row=3, column=1, columnspan=2, sticky="w", pady=(self._pad_y(4), 0))
-        devices_frame = ttk.LabelFrame(inner, text="Устройства", style="Section.TLabelframe", padding=self._pad(14, 12))
-        devices_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, self._pad_y(14)))
+        devices_frame = ttk.LabelFrame(inner, text="Устройства", style="Section.TLabelframe", padding=self._pad(12, 10))
+        devices_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, self._pad_y(10)))
         devices_frame.grid_columnconfigure(1, weight=1)
         devices_frame.grid_columnconfigure(2, weight=1)
 
@@ -785,7 +824,7 @@ class LabForgeApp(tk.Tk):
         ).grid(row=1, column=2, sticky="w", padx=(self._pad_x(12), 0))
 
         device_buttons = ttk.Frame(devices_frame, style="Card.TFrame")
-        device_buttons.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(self._pad_y(10), 0))
+        device_buttons.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(self._pad_y(8), 0))
         for idx in range(4):
             device_buttons.grid_columnconfigure(idx, weight=1)
         ttk.Button(device_buttons, text="Обновить порты", style="Soft.TButton", command=self.refresh_ports).grid(row=0, column=0, sticky="ew", padx=(0, self._pad_x(6)))
@@ -814,15 +853,16 @@ class LabForgeApp(tk.Tk):
 
         for section_title, fields in SETTINGS_SECTIONS:
             row, column = section_positions.get(section_title, (3, 1))
-            frame = ttk.LabelFrame(inner, text=section_title, style="Section.TLabelframe", padding=self._pad(14, 12))
-            frame.grid(row=row, column=column, sticky="nsew", pady=(0, self._pad_y(14)), padx=(0, self._pad_x(10)) if column == 0 else (self._pad_x(10), 0))
+            frame = ttk.LabelFrame(inner, text=section_title, style="Section.TLabelframe", padding=self._pad(12, 10))
+            frame.grid(row=row, column=column, sticky="nsew", pady=(0, self._pad_y(10)), padx=(0, self._pad_x(8)) if column == 0 else (self._pad_x(8), 0))
             frame.grid_columnconfigure(1, weight=1)
             frame.grid_columnconfigure(2, weight=1)
             self._build_settings_section(frame, fields)
 
         self._apply_theme_to_toplevel(self._settings_window)
         self._update_settings_control_states()
-        self._fade_in_toplevel(self._settings_window)
+        self._settings_window.update_idletasks()
+        self._settings_window.focus_set()
 
     def _build_settings_section(self, parent, fields) -> None:
         parent.grid_columnconfigure(0, weight=0, minsize=int(210 * self.ui_scale))
@@ -832,7 +872,7 @@ class LabForgeApp(tk.Tk):
             tooltip_text = self._build_setting_tooltip(key, tooltip)
             label_widget = ttk.Label(parent, text=label, style="CardText.TLabel")
             label_widget.configure(font=("Segoe UI", max(11, int(12 * self.ui_scale))))
-            label_widget.grid(row=row, column=0, sticky="w", padx=(0, self._pad_x(12)), pady=(self._pad_y(6), self._pad_y(6)))
+            label_widget.grid(row=row, column=0, sticky="w", padx=(0, self._pad_x(10)), pady=(self._pad_y(4), self._pad_y(4)))
             ToolTip(label_widget, tooltip_text)
 
             var = self.setting_vars[key]
@@ -847,15 +887,15 @@ class LabForgeApp(tk.Tk):
                 widget.configure(font=("Segoe UI", max(11, int(12 * self.ui_scale))))
             if kind == "bool":
                 widget.configure(style="Card.TCheckbutton")
-            widget.grid(row=row, column=1, sticky="ew", pady=(self._pad_y(6), self._pad_y(6)))
+            widget.grid(row=row, column=1, sticky="ew", pady=(self._pad_y(4), self._pad_y(4)))
             hint_label = ttk.Label(parent, text=f"{tooltip} По умолчанию: {DEFAULTS[key]}", style="CardAltText.TLabel", wraplength=int(420 * self.ui_scale))
             hint_label.configure(font=("Segoe UI", max(11, int(12 * self.ui_scale))))
             hint_label.grid(
                 row=row,
                 column=2,
                 sticky="w",
-                padx=(self._pad_x(12), 0),
-                pady=(self._pad_y(6), self._pad_y(6)),
+                padx=(self._pad_x(10), 0),
+                pady=(self._pad_y(4), self._pad_y(4)),
             )
             ToolTip(widget, tooltip_text)
 
@@ -1200,21 +1240,47 @@ class LabForgeApp(tk.Tk):
         )
 
     def _bind_mousewheel_to_canvas(self, canvas: tk.Canvas) -> None:
-        def on_mousewheel(event) -> None:
-            delta = 0
-            if getattr(event, "delta", 0):
-                delta = -1 if event.delta > 0 else 1
-            elif getattr(event, "num", None) == 4:
-                delta = -1
-            elif getattr(event, "num", None) == 5:
-                delta = 1
-            if delta:
-                canvas.yview_scroll(delta, "units")
+        def activate(_event=None) -> None:
+            self._active_scroll_canvas = canvas
 
-        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", on_mousewheel))
-        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
-        canvas.bind_all("<Button-4>", on_mousewheel)
-        canvas.bind_all("<Button-5>", on_mousewheel)
+        def deactivate(_event=None) -> None:
+            if getattr(self, "_active_scroll_canvas", None) is canvas:
+                self._active_scroll_canvas = None
+
+        if not getattr(self, "_global_scroll_binding_ready", False):
+            self.bind_all("<MouseWheel>", self._on_global_mousewheel, add="+")
+            self.bind_all("<Button-4>", self._on_global_mousewheel, add="+")
+            self.bind_all("<Button-5>", self._on_global_mousewheel, add="+")
+            self._global_scroll_binding_ready = True
+
+        canvas.bind("<Enter>", activate, add="+")
+        canvas.bind("<Leave>", deactivate, add="+")
+        canvas.bind("<Destroy>", deactivate, add="+")
+
+    def _on_global_mousewheel(self, event) -> None:
+        canvas = getattr(self, "_active_scroll_canvas", None)
+        if canvas is None or not canvas.winfo_exists():
+            return
+
+        delta = 0
+        if getattr(event, "delta", 0):
+            delta = -1 if event.delta > 0 else 1
+        elif getattr(event, "num", None) == 4:
+            delta = -1
+        elif getattr(event, "num", None) == 5:
+            delta = 1
+        if not delta:
+            return
+
+        try:
+            top, bottom = canvas.yview()
+            span = max(0.0, bottom - top)
+            max_top = max(0.0, 1.0 - span)
+            step = 0.035
+            new_top = min(max_top, max(0.0, top + (step * delta)))
+            canvas.yview_moveto(new_top)
+        except tk.TclError:
+            return
 
     def _style_indicator(self, indicator: dict[str, object], palette: ThemePalette) -> None:
         frame = indicator["frame"]
@@ -1284,42 +1350,18 @@ class LabForgeApp(tk.Tk):
         if hasattr(self, "log_menu_button"):
             self.log_menu_button.configure(text="Лог ▾" if self.right_panel_visible else "Лог")
 
-    def _fade_in_toplevel(self, window: tk.Toplevel, *, current: float = 0.0) -> None:
-        try:
-            window.attributes("-alpha", min(1.0, current))
-        except Exception:
-            return
-        if current >= 1.0:
-            return
-        window.after(16, lambda: self._fade_in_toplevel(window, current=current + 0.12))
-
-    def _fade_out_and_destroy(self, window: tk.Toplevel | None, *, current: float | None = None) -> None:
+    def _close_settings_window(self) -> None:
+        window = getattr(self, "_settings_window", None)
         if window is None or not window.winfo_exists():
             return
 
-        if current is None and window is getattr(self, "_settings_window", None) and not bool(self.autosave_settings_var.get()):
+        if not bool(self.autosave_settings_var.get()):
             self._restore_settings_from_disk()
 
-        if current is None:
-            try:
-                current = float(window.attributes("-alpha"))
-            except Exception:
-                current = 1.0
-
-        next_alpha = current - 0.14
-        if next_alpha <= 0.0:
-            try:
-                window.grab_release()
-            except Exception:
-                pass
-            window.destroy()
-            return
-
         try:
-            window.attributes("-alpha", next_alpha)
-            window.after(16, lambda: self._fade_out_and_destroy(window, current=next_alpha))
-        except Exception:
             window.destroy()
+        except Exception:
+            return
 
     def _poll_runtime_queues(self) -> None:
         for snapshot in self.controller.drain_snapshots():
@@ -1472,6 +1514,7 @@ class LabForgeApp(tk.Tk):
         self.diag_status_var.set("Настройки автоматически сохранены.")
         self._log_settings_changes(before, dataclasses.asdict(self.config_data))
         self._update_settings_control_states()
+        self._pulse_autosave_badge()
 
     def _update_settings_control_states(self) -> None:
         autosave_enabled = bool(self.autosave_settings_var.get())
@@ -1501,6 +1544,20 @@ class LabForgeApp(tk.Tk):
                 borderwidth=1,
             )
 
+    def _pulse_autosave_badge(self) -> None:
+        if not hasattr(self, "settings_mode_badge") or not self.settings_mode_badge.winfo_exists():
+            return
+        if not bool(self.autosave_settings_var.get()):
+            return
+        base_bg = str(self.settings_mode_badge.cget("bg"))
+        accent = "#8AF3E5" if self.theme_manager.palette.name == "dark" else "#11A799"
+        self.settings_mode_badge.configure(bg=accent)
+        self.after(180, lambda: self._restore_badge_color(base_bg))
+
+    def _restore_badge_color(self, color: str) -> None:
+        if hasattr(self, "settings_mode_badge") and self.settings_mode_badge.winfo_exists():
+            self.settings_mode_badge.configure(bg=color)
+
     def _settings_port_label(self, port: PortInfo) -> str:
         return f"{port.device} - {port.description} - {guess_port_kind(port)}"
 
@@ -1522,6 +1579,8 @@ class LabForgeApp(tk.Tk):
             self.config_data.scale.timeout = self._get_float("scale.timeout")
             self.config_data.scale.mode = self._get_str("scale.mode").lower()
             self.config_data.scale.request_command = self._get_str("scale.request_command")
+            self.config_data.scale.p1_polling_enabled = self._get_bool("scale.p1_polling_enabled")
+            self.config_data.scale.p1_poll_interval_sec = self._get_float("scale.p1_poll_interval_sec")
             self.config_data.furnace.enabled = self._get_bool("furnace.enabled")
             self.config_data.furnace.baudrate = self._get_int("furnace.baudrate")
             self.config_data.furnace.bytesize = self._get_int("furnace.bytesize")
@@ -1785,11 +1844,14 @@ class LabForgeApp(tk.Tk):
         self.zero_button.state(["!disabled"] if self._scale_actions_allowed() else ["disabled"])
 
     def save_runtime_log(self) -> None:
+        log_dir = resolve_path(self.config_data.app.log_path).parent
+        log_dir.mkdir(parents=True, exist_ok=True)
         target = filedialog.asksaveasfilename(
             parent=self,
             title="Сохранить журнал",
             defaultextension=".txt",
             filetypes=[("Текстовый файл", "*.txt"), ("Все файлы", "*.*")],
+            initialdir=str(log_dir),
             initialfile="datafusion_rt_log.txt",
         )
         if not target:
