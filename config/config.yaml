@@ -1,6 +1,6 @@
 scale:
   enabled: true
-  port: COM7
+  port: COM4
   baudrate: 9600
   timeout: 1.0
   mode: continuous
@@ -8,27 +8,91 @@ scale:
   p1_polling_enabled: true
   p1_poll_interval_sec: 0.1
 furnace:
-  enabled: false
-  port: COM4
+  enabled: true
+  port: COM11
   baudrate: 9600
   bytesize: 7
-  parity: N
+  parity: E
   stopbits: 1.0
   timeout: 1.0
   slave_id: 1
-  register_pv: 0
-  register_sv: 1
+  register_pv: 90
+  register_sv: 91
   scale_factor: 0.1
+  driver: dk518
+  access_mode: read_only
+  read_groups:
+  - name: input_temperature_block
+    function: 4
+    address: 90
+    count: 2
+    scale: 0.1
+    pv_index: 0
+    sv_index: 1
+  - name: hold_0x0015
+    function: 3
+    address: 21
+    count: 3
+    scale: 1.0
+  - name: hold_0x0056
+    function: 3
+    address: 86
+    count: 3
+    scale: 1.0
+  - name: hold_0x0006
+    function: 3
+    address: 6
+    count: 3
+    scale: 1.0
+  window_enabled: false
+  window_period_ms: 1000
+  window_open_ms: 120
+  window_offset_ms: 0
+  experimental_write_enabled: false
+  input_type_code: 0
+  input_type_name: K
+  high_limit: 1200.0
+  high_alarm: 999.9
+  low_alarm: 999.9
+  pid_p: 10.0
+  pid_t: 8.0
+  ctrl_mode: 3
+  output_high_limit: 100.0
+  display_decimals: 2
+  sensor_correction: 0.0
+  opt_code: 8
+  run_code: 27
+  alarm_output_code: 3333
+  m5_value: 420.0
 app:
   poll_interval_sec: 1.0
   csv_path: data/measurements.csv
   log_path: logs/app.log
   max_points_on_plot: 500
-  test_mode: false
+  auto_detect_ports: true
+  test_mode: true
+  test_mode_scope: all
   autosave_settings: true
   enable_file_logging: false
   theme: dark
   start_maximized: true
   fullscreen: false
-  font_scale: 1.05
+  font_scale: 1.0
   default_export_format: csv
+  plot_styles:
+    mass:
+      color: '#0F766E'
+      linewidth: 2.15
+      linestyle: --
+    temperature:
+      color: '#C2410C'
+      linewidth: 2.15
+      linestyle: '-'
+    thermocouple:
+      color: '#F6A04D'
+      linewidth: 2.15
+      linestyle: '-'
+  plot_autoscale_enabled: true
+  plot_manual_x_seconds: 1000.0
+  plot_manual_y_span: 500.0
+  plot_y_headroom: 150.0

@@ -211,7 +211,7 @@ class ThemeManager:
         style.configure(
             "Soft.TButton",
             font=("Segoe UI", size(11)),
-            padding=(size(12), size(8)),
+            padding=(size(10), size(6)),
             background=palette.button_soft_bg,
             foreground=palette.text,
             bordercolor=palette.border,
@@ -308,6 +308,45 @@ class ThemeManager:
             padding=[
                 ("selected", (size(18), size(10))),
                 ("active", (size(18), size(10))),
+            ],
+            bordercolor=[
+                ("selected", palette.accent),
+                ("active", palette.accent),
+            ],
+            lightcolor=[
+                ("selected", palette.accent),
+                ("active", palette.border),
+            ],
+            darkcolor=[
+                ("selected", palette.accent),
+                ("active", palette.border),
+            ],
+        )
+        style.configure(
+            "Compact.TNotebook",
+            background=palette.app_bg,
+            borderwidth=0,
+            tabmargins=(0, 0, 0, 0),
+        )
+        style.configure(
+            "Compact.TNotebook.Tab",
+            background=palette.button_soft_bg,
+            foreground=palette.text,
+            bordercolor=palette.border,
+            lightcolor=palette.border,
+            darkcolor=palette.border,
+            padding=(size(14), size(4)),
+            font=("Segoe UI Semibold", size(10)),
+        )
+        style.map(
+            "Compact.TNotebook.Tab",
+            background=[
+                ("selected", palette.accent if palette.name == "dark" else "#DCEFEB"),
+                ("active", palette.button_soft_active),
+            ],
+            foreground=[
+                ("selected", "#081016" if palette.name == "dark" else "#0F3F3A"),
+                ("active", palette.text),
             ],
             bordercolor=[
                 ("selected", palette.accent),

@@ -43,6 +43,32 @@ class MeasurementExportService:
         self.logger.info("Measurements exported to %s", destination)
         return True, f"Данные экспортированы: {destination}"
 
+    def export_frame(self, frame: pd.DataFrame, destination: Path) -> tuple[bool, str]:
+        if frame.empty:
+            return False, "Нет данных для экспорта."
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        extension = destination.suffix.lower()
+
+        try:
+            if extension == ".csv":
+                frame.to_csv(destination, index=False, encoding="utf-8-sig")
+            elif extension == ".xlsx":
+                frame.to_excel(destination, index=False, engine="openpyxl")
+            elif extension == ".xml":
+                frame.to_xml(destination, index=False, root_name="measurements", row_name="measurement")
+            else:
+                return False, f"Неподдерживаемый формат экспорта: {destination.suffix}"
+        except ImportError as exc:
+            self.logger.exception("Missing export dependency.")
+            return False, f"Для экспорта в {destination.suffix} не хватает зависимости: {exc}"
+        except Exception as exc:
+            self.logger.exception("Failed to export measurement data to %s", destination)
+            return False, f"Ошибка экспорта: {exc}"
+
+        self.logger.info("Measurements exported to %s", destination)
+        return True, f"Данные экспортированы: {destination}"
+
     def _load_frame(self, source_csv: Path) -> pd.DataFrame:
         if not source_csv.exists():
             raise FileNotFoundError(source_csv)
@@ -52,9 +78,9 @@ class MeasurementExportService:
             raise ValueError("Нет данных для экспорта.")
 
         normalized = pd.DataFrame()
-        normalized["sample_index"] = range(1, len(frame) + 1)
-        normalized["timestamp"] = frame.get("timestamp")
-        normalized["mass"] = frame.get("mass")
-        normalized["furnace_pv"] = frame.get("furnace_pv")
-        normalized["furnace_sv"] = frame.get("furnace_sv")
+        normalized["№"] = range(1, len(frame) + 1)
+        normalized["Время"] = frame.get("timestamp")
+        normalized["Масса, г"] = frame.get("mass")
+        normalized["Температура камеры PV, °C"] = frame.get("furnace_pv")
+        normalized["Температура термопары SV, °C"] = frame.get("furnace_sv")
         return normalized

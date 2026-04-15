@@ -12,7 +12,15 @@ class CSVDataLogger:
         self.csv_path = csv_path
         self.logger = logger or logging.getLogger(__name__)
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
-        self._fieldnames = ("timestamp", "mass", "furnace_pv", "furnace_sv")
+        self._fieldnames = (
+            "timestamp",
+            "mass",
+            "furnace_pv",
+            "furnace_sv",
+            "mass_timestamp",
+            "furnace_pv_timestamp",
+            "furnace_sv_timestamp",
+        )
         self._header_written = self.csv_path.exists() and self.csv_path.stat().st_size > 0
 
     def append(self, record: MeasurementRecord) -> None:

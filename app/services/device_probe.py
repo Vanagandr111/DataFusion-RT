@@ -7,6 +7,7 @@ import serial
 
 from app.models import FurnaceConfig, ScaleConfig
 from app.services.furnace_reader import FurnaceReader
+from app.services.passive_furnace_reader import PassiveFurnaceReader
 from app.utils.parsers import parse_mass_line
 
 
@@ -89,6 +90,23 @@ def probe_furnace_port(
     if not port_name:
         logger.warning("Проверка печи пропущена: COM-порт не выбран.")
         return False, "COM-порт для печи не выбран."
+
+    driver = (config.driver or "modbus").lower()
+    if driver == "dk518":
+        reader = PassiveFurnaceReader(config, test_mode=False, logger=logger.getChild("probe"))
+        deadline = time.monotonic() + max(2.5, config.timeout * 8.0)
+        try:
+            while time.monotonic() < deadline:
+                pv, sv = reader.read_temperatures()
+                if pv is not None:
+                    return True, f"Печь обнаружена на {port_name}: камера {pv:.2f} °C (пассивное прослушивание)"
+                if sv is not None:
+                    return True, f"Печь обнаружена на {port_name}: термопара {sv:.2f} °C (пассивное прослушивание)"
+                time.sleep(0.05)
+            logger.warning("Во время пассивной проверки печи на %s не обнаружен RS-485 трафик.", port_name)
+            return False, f"На {port_name} не замечен трафик печи. Пассивная проверка ничего не услышала."
+        finally:
+            reader.close()
 
     reader = FurnaceReader(config, test_mode=False, logger=logger.getChild("probe"))
     try:

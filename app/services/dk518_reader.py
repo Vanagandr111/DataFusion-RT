@@ -13,7 +13,7 @@ except Exception:  # pragma: no cover - import fallback for missing dependency
 from app.models import FurnaceConfig
 
 
-class FurnaceReader:
+class DK518Reader:
     def __init__(
         self,
         config: FurnaceConfig,
@@ -24,9 +24,9 @@ class FurnaceReader:
         self.test_mode = test_mode
         self.logger = logger or logging.getLogger(__name__)
         self._client: ModbusSerialClient | None = None
-        self._test_started = time.monotonic()
         self._next_connect_attempt_at = 0.0
         self._device_id_arg_name: str | None = None
+        self._test_started = time.monotonic()
 
         if self.config.enabled and not self.test_mode:
             self.connect()
@@ -36,7 +36,7 @@ class FurnaceReader:
             return False
 
         if ModbusSerialClient is None:
-            self.logger.error("Библиотека pymodbus не установлена. Чтение печи отключено.")
+            self.logger.error("Библиотека pymodbus не установлена. Чтение DK518 отключено.")
             return False
 
         self.close()
@@ -51,42 +51,28 @@ class FurnaceReader:
                 timeout=self.config.timeout,
             )
             if not client.connect():
-                self.logger.warning("Не удалось открыть Modbus-порт печи: %s", self.config.port)
+                self.logger.warning("Не удалось открыть Modbus-порт DK518: %s", self.config.port)
                 client.close()
                 self._next_connect_attempt_at = time.monotonic() + 5.0
                 return False
             self._client = client
             self._next_connect_attempt_at = 0.0
-            self.logger.info("Подключение к печи открыто на %s", self.config.port)
+            self.logger.info("Подключение к DK518 открыто на %s", self.config.port)
             return True
         except Exception as exc:
-            self.logger.warning("Не удалось инициализировать Modbus-клиент печи на %s: %s", self.config.port, exc)
+            self.logger.warning("Не удалось инициализировать Modbus-клиент DK518 на %s: %s", self.config.port, exc)
             self._client = None
             self._next_connect_attempt_at = time.monotonic() + 5.0
             return False
 
-    def read_pv(self) -> float | None:
-        if self.test_mode:
-            elapsed = time.monotonic() - self._test_started
-            base = min(650.0, 25.0 + elapsed * 2.4)
-            return round(base + math.sin(elapsed / 6.0) * 3.0, 2)
-        return self._read_register_scaled(self.config.register_pv, label="PV")
-
-    def read_sv(self) -> float | None:
-        if self.test_mode:
-            elapsed = time.monotonic() - self._test_started
-            return 650.0 if elapsed >= 30 else 400.0
-        return self._read_register_scaled(self.config.register_sv, label="SV")
-
-    def read_temperatures(self) -> tuple[float | None, float | None]:
-        if self.test_mode:
-            return self.read_pv(), self.read_sv()
-        if self.config.register_sv == self.config.register_pv + 1:
-            registers = self._read_register_block(self.config.register_pv, 2)
-            if registers and len(registers) >= 2:
-                scale = self.config.scale_factor
-                return float(registers[0]) * scale, float(registers[1]) * scale
-        return self.read_pv(), self.read_sv()
+    def close(self) -> None:
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                self.logger.debug("Ignoring DK518 close error.", exc_info=True)
+            finally:
+                self._client = None
 
     @property
     def connected(self) -> bool:
@@ -94,36 +80,70 @@ class FurnaceReader:
             return True
         return self._client is not None
 
-    def close(self) -> None:
-        if self._client is not None:
-            try:
-                self._client.close()
-            except Exception:
-                self.logger.debug("Ignoring furnace close error.", exc_info=True)
-            finally:
-                self._client = None
+    def read_pv(self) -> float | None:
+        if self.test_mode:
+            elapsed = time.monotonic() - self._test_started
+            base = min(650.0, 25.0 + elapsed * 2.4)
+            return round(base + math.sin(elapsed / 6.0) * 3.0, 2)
+        values = self._read_groups()
+        return self._extract_role(values, role_key="pv_index")
 
-    def _read_register_scaled(self, register: int, label: str) -> float | None:
+    def read_sv(self) -> float | None:
+        if self.test_mode:
+            elapsed = time.monotonic() - self._test_started
+            return 650.0 if elapsed >= 30 else 400.0
+        values = self._read_groups()
+        return self._extract_role(values, role_key="sv_index")
+
+    def read_temperatures(self) -> tuple[float | None, float | None]:
+        if self.test_mode:
+            return self.read_pv(), self.read_sv()
+        values = self._read_groups()
+        return self._extract_role(values, role_key="pv_index"), self._extract_role(values, role_key="sv_index")
+
+    def send_test_command(self, _name: str, _payload: object | None = None) -> bool:
+        self.logger.warning("Режим тестовых команд для DK518 пока не реализован.")
+        return False
+
+    def _extract_role(self, groups: dict[str, list[float]] | None, *, role_key: str) -> float | None:
+        if not groups:
+            return None
+        for group in self.config.read_groups:
+            if role_key not in group:
+                continue
+            name = str(group.get("name", "")).strip()
+            if not name:
+                continue
+            try:
+                index = int(group.get(role_key))
+            except (TypeError, ValueError):
+                continue
+            values = groups.get(name, [])
+            if 0 <= index < len(values):
+                return values[index]
+        return None
+
+    def _read_groups(self) -> dict[str, list[float]] | None:
         if not self.config.enabled:
             return None
-
         if not self._ensure_connection():
             return None
 
-        try:
-            response = self._read_register(register)
-            if response is None:
-                return None
-            return float(response) * self.config.scale_factor
-        except Exception:
-            self.logger.exception(
-                "Непредвиденная ошибка при чтении параметра печи %s из регистра %s",
-                label,
-                register,
-            )
-            self.close()
-            self._next_connect_attempt_at = time.monotonic() + 5.0
-            return None
+        results: dict[str, list[float]] = {}
+        for group in self.config.read_groups:
+            name = str(group.get("name", "")).strip() or "group"
+            try:
+                function_code = int(group.get("function", 3))
+                address = int(group.get("address", 0))
+                count = int(group.get("count", 1))
+                scale = float(group.get("scale", 1.0))
+            except (TypeError, ValueError):
+                continue
+            registers = self._read_registers(function_code, address, count)
+            if registers is None:
+                continue
+            results[name] = [value * scale for value in registers]
+        return results or None
 
     def _ensure_connection(self) -> bool:
         if self._client is not None:
@@ -132,22 +152,28 @@ class FurnaceReader:
             return False
         return self.connect()
 
-    def _read_register(self, register: int) -> int | None:
-        registers = self._read_register_block(register, 1)
-        if not registers:
-            return None
-        return int(registers[0])
-
-    def _read_register_block(self, register: int, count: int) -> list[int] | None:
+    def _read_registers(self, function_code: int, address: int, count: int) -> list[int] | None:
         if self._client is None:
             return None
 
+        device_arg = self._resolve_device_id_arg_name()
+        kwargs = {
+            "address": address,
+            "count": count,
+        }
+        if device_arg is not None:
+            kwargs[device_arg] = self.config.slave_id
+
         try:
-            response = self._read_holding_registers(register, count)
+            if function_code == 4:
+                response = self._client.read_input_registers(**kwargs)
+            else:
+                response = self._client.read_holding_registers(**kwargs)
         except Exception:
             self.logger.warning(
-                "Ошибка чтения Modbus регистра %s у устройства %s",
-                register,
+                "Ошибка чтения Modbus регистра %s (func=%s) у устройства %s",
+                address,
+                function_code,
                 self.config.slave_id,
                 exc_info=True,
             )
@@ -156,33 +182,14 @@ class FurnaceReader:
             return None
 
         if response is None:
-            self.logger.warning("Пустой ответ Modbus для регистра %s", register)
             return None
-
         if hasattr(response, "isError") and response.isError():
-            self.logger.warning("Ошибка Modbus при чтении регистра %s: %s", register, response)
             return None
 
         registers = getattr(response, "registers", None)
         if not registers:
-            self.logger.warning("Нет данных регистра в ответе для регистра %s", register)
             return None
-
         return [int(value) for value in registers]
-
-    def _read_holding_registers(self, register: int, count: int):
-        if self._client is None:
-            return None
-
-        device_arg = self._resolve_device_id_arg_name()
-        kwargs = {
-            "address": register,
-            "count": count,
-        }
-        if device_arg is not None:
-            kwargs[device_arg] = self.config.slave_id
-
-        return self._client.read_holding_registers(**kwargs)
 
     def _resolve_device_id_arg_name(self) -> str | None:
         if self._device_id_arg_name is not None:
