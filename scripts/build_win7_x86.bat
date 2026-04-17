@@ -37,6 +37,10 @@ if errorlevel 1 (
     exit /b 1
 )
 
+if exist "scripts\pyinstaller_hooks\pyi_rth_mplconfig.py" (
+    copy /y "scripts\pyinstaller_hooks\pyi_rth_mplconfig.py" "%VENV_DIR%\Lib\site-packages\PyInstaller\hooks\rthooks\pyi_rth_mplconfig.py" >nul
+)
+
 for /f %%i in ('python -c "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"') do set "PYVER=%%i"
 for /f %%i in ('python -c "import struct; print(struct.calcsize('P') * 8)"') do set "PYBITS=%%i"
 
