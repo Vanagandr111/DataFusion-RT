@@ -2,6 +2,12 @@
 
 Windows GUI-приложение на Python для сбора данных с лабораторных весов Adam Highland HCB и печи с PID-контроллером по RS-485 / Modbus RTU.
 
+## Для разработчика
+
+Краткая внутренняя документация лежит здесь:
+
+- [DEV_QUICKSTART_RU.md](DEV_QUICKSTART_RU.md)
+
 ## Что умеет текущая версия
 
 - GUI на `tkinter` со встроенным live-графиком `matplotlib`;
@@ -173,6 +179,16 @@ GUI показывает порт в формате:
 ```bat
 scripts\build_exe.bat
 ```
+
+Подробно по совместимости сборок:
+
+- [BUILD_WINDOWS_COMPAT_RU.md](BUILD_WINDOWS_COMPAT_RU.md)
+
+Быстрые команды:
+
+- `scripts\\build_exe.bat modern`
+- `scripts\\install_win7.bat`
+- `scripts\\build_win7.bat`
 
 После сборки рядом с `.exe` должен лежать `config/config.yaml`.
 

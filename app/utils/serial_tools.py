@@ -32,11 +32,13 @@ def guess_port_kind(port: PortInfo) -> str:
 def detect_preferred_ports(ports: list[PortInfo]) -> dict[str, PortInfo]:
     furnace_candidates: list[tuple[int, PortInfo]] = []
     scale_candidates: list[tuple[int, PortInfo]] = []
+    serial_like_candidates: list[PortInfo] = []
 
     for port in ports:
         haystack = f"{port.device} {port.description} {port.hwid}".lower()
         furnace_score = 0
         scale_score = 0
+        serial_like = False
 
         if any(
             token in haystack
@@ -54,6 +56,7 @@ def detect_preferred_ports(ports: list[PortInfo]) -> dict[str, PortInfo]:
             )
         ):
             furnace_score += 3
+            serial_like = True
         if any(token in haystack for token in ("modbus", "converter", "adapter")):
             furnace_score += 2
         if "bluetooth" in haystack:
@@ -73,6 +76,7 @@ def detect_preferred_ports(ports: list[PortInfo]) -> dict[str, PortInfo]:
             )
         ):
             scale_score += 3
+            serial_like = True
         if any(
             token in haystack
             for token in (
@@ -84,16 +88,22 @@ def detect_preferred_ports(ports: list[PortInfo]) -> dict[str, PortInfo]:
             )
         ):
             scale_score += 2
+            serial_like = True
         if any(
             token in haystack
             for token in ("ch340", "wch", "ftdi", "uart", "serial port")
         ):
             scale_score += 1
+            serial_like = True
+        if "bluetooth" in haystack:
+            scale_score -= 5
 
         if furnace_score > 0:
             furnace_candidates.append((furnace_score, port))
         if scale_score > 0:
             scale_candidates.append((scale_score, port))
+        if serial_like and "bluetooth" not in haystack:
+            serial_like_candidates.append(port)
 
     result: dict[str, PortInfo] = {}
     used_devices: set[str] = set()
@@ -123,9 +133,20 @@ def detect_preferred_ports(ports: list[PortInfo]) -> dict[str, PortInfo]:
                 break
 
     if "scale" not in result:
-        for port in ports:
+        for port in serial_like_candidates:
             if port.device.upper() not in used_devices:
                 result["scale"] = port
+                used_devices.add(port.device.upper())
+                break
+
+    if "scale" not in result:
+        for port in ports:
+            haystack = f"{port.device} {port.description} {port.hwid}".lower()
+            if "bluetooth" in haystack:
+                continue
+            if port.device.upper() not in used_devices:
+                result["scale"] = port
+                used_devices.add(port.device.upper())
                 break
 
     return result

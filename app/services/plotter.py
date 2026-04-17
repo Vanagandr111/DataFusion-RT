@@ -2,17 +2,47 @@ from __future__ import annotations
 
 import logging
 import math
-from collections import deque
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import Misc, ttk
 
 import matplotlib.dates as mdates
+import matplotlib.ticker as mticker
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
 from app.models import MeasurementRecord
-from app.services.heating_profile import HeatingProfileResult, build_heating_profile
+from app.services.heating_profile import (
+    HeatingProfileResult,
+    build_heating_profile,
+    summarize_furnace_profile,
+)
+from app.services.noise_filter import (
+    NoiseReductionConfig,
+    apply_noise_reduction,
+    auto_noise_reduction,
+)
+from app.services.plot_series_helpers import (
+    append_series_sample,
+    coerce_timestamp,
+    first_finite,
+    first_finite_index,
+    last_finite,
+    last_finite_index,
+    mass_series_values as build_mass_series_values,
+    normalize_mass_values,
+    series_values as build_series_values,
+    delta_values as build_delta_values,
+    dtg_values as build_dtg_values,
+    smooth_values,
+)
+from app.services.plot_style_helpers import (
+    legend_label as build_legend_label,
+    sanitize_series_style,
+    series_display_name,
+    series_style,
+)
 from app.theme import PlotTheme
 
 
@@ -23,6 +53,8 @@ class LivePlotter:
     VIEW_TEMP = "temp"
     VIEW_DELTA = "delta"
     VIEW_DTG = "dtg"
+    RANGE_SEGMENT = "segment"
+    RANGE_FULL = "full"
 
     RENDER_LINE = "line"
     RENDER_POINTS = "points"
@@ -36,6 +68,8 @@ class LivePlotter:
         self._pan_active = False
         self._view_mode = self.VIEW_COMBINED
         self._render_mode = self.RENDER_LINE
+        self._points_enabled = False
+        self._smooth_enabled = False
         self._normalization_enabled = False
         self._markers_enabled = False
         self._marker_indices: dict[str, int] = {}
@@ -45,6 +79,7 @@ class LivePlotter:
         self._manual_x_seconds = 600.0
         self._manual_y_span = 250.0
         self._y_headroom = 50.0
+        self._plot_range_mode = self.RANGE_SEGMENT
         self._display_paused = False
         self._viewport_locked = False
         self._saved_xlim: tuple[float, float] | None = None
@@ -52,21 +87,30 @@ class LivePlotter:
         self._sticky_y_limits: dict[str, tuple[float, float]] = {}
         self._x_pad_seconds = 2.0
         self._series_style_overrides: dict[str, dict[str, object]] = {}
+        self._relative_time_axis = True
         self._cursor_probe_enabled = False
         self._cursor_guides: dict[object, tuple[object, object, object]] = {}
         self._cursor_anchor_points: list[dict[str, object]] = []
+        self._point_pick_callback = None
+        self._time_span_pick_callback = None
+        self._time_span_pick_start: datetime | None = None
+        self._time_span_hover: datetime | None = None
+        self._last_hover_label = ""
+        self._last_hover_at = 0.0
         self._series_visibility = {"mass": True, "temperature": True, "thermocouple": True, "heating_profile": True}
         self._heating_profile_enabled = False
         self._heating_profile_dirty = True
         self._heating_profile_result = HeatingProfileResult([], [], "temperature", ())
+        self._display_max_points = max_points
+        self._noise_reduction = NoiseReductionConfig()
 
-        self.timestamps: deque[datetime] = deque(maxlen=max_points)
-        self.mass_timestamps: deque[datetime] = deque(maxlen=max_points)
-        self.temperature_timestamps: deque[datetime] = deque(maxlen=max_points)
-        self.thermocouple_timestamps: deque[datetime] = deque(maxlen=max_points)
-        self.masses: deque[float] = deque(maxlen=max_points)
-        self.temperatures: deque[float] = deque(maxlen=max_points)
-        self.thermocouple_temperatures: deque[float] = deque(maxlen=max_points)
+        self.timestamps: list[datetime] = []
+        self.mass_timestamps: list[datetime] = []
+        self.temperature_timestamps: list[datetime] = []
+        self.thermocouple_timestamps: list[datetime] = []
+        self.masses: list[float] = []
+        self.temperatures: list[float] = []
+        self.thermocouple_temperatures: list[float] = []
 
         self.container = ttk.Frame(master, style="Card.TFrame")
         self.figure = Figure(figsize=(10.4, 5.9), dpi=100)
@@ -100,6 +144,14 @@ class LivePlotter:
         return self._render_mode
 
     @property
+    def points_enabled(self) -> bool:
+        return self._points_enabled
+
+    @property
+    def smooth_enabled(self) -> bool:
+        return self._smooth_enabled
+
+    @property
     def normalization_enabled(self) -> bool:
         return self._normalization_enabled
 
@@ -123,17 +175,34 @@ class LivePlotter:
     def heating_profile_enabled(self) -> bool:
         return self._heating_profile_enabled
 
+    @property
+    def relative_time_axis_enabled(self) -> bool:
+        return self._relative_time_axis
+
+    @property
+    def plot_range_mode(self) -> str:
+        return self._plot_range_mode
+
     def set_max_points(self, max_points: int) -> None:
-        if max_points <= 0 or max_points == self.timestamps.maxlen:
+        if max_points <= 0 or max_points == self._display_max_points:
             return
-        self.timestamps = deque(self.timestamps, maxlen=max_points)
-        self.mass_timestamps = deque(self.mass_timestamps, maxlen=max_points)
-        self.temperature_timestamps = deque(self.temperature_timestamps, maxlen=max_points)
-        self.thermocouple_timestamps = deque(self.thermocouple_timestamps, maxlen=max_points)
-        self.masses = deque(self.masses, maxlen=max_points)
-        self.temperatures = deque(self.temperatures, maxlen=max_points)
-        self.thermocouple_temperatures = deque(self.thermocouple_temperatures, maxlen=max_points)
+        self._display_max_points = max_points
         self._render_current_view()
+
+    def set_plot_range_mode(self, range_mode: str) -> None:
+        if range_mode not in {self.RANGE_SEGMENT, self.RANGE_FULL}:
+            return
+        if range_mode == self._plot_range_mode:
+            return
+        self._plot_range_mode = range_mode
+        self._viewport_locked = False
+        self._saved_xlim = None
+        self._render_current_view()
+
+    def toggle_time_axis_mode(self) -> bool:
+        self._relative_time_axis = not self._relative_time_axis
+        self._render_current_view()
+        return self._relative_time_axis
 
     def set_view_mode(self, view_mode: str) -> None:
         if view_mode == self._view_mode:
@@ -143,10 +212,26 @@ class LivePlotter:
         self._render_current_view()
 
     def set_render_mode(self, render_mode: str) -> None:
-        if render_mode == self._render_mode:
-            return
-        self._render_mode = render_mode
+        if render_mode == self.RENDER_POINTS:
+            self._points_enabled = True
+            self._render_mode = self.RENDER_POINTS
+        elif render_mode == self.RENDER_SMOOTH:
+            self._smooth_enabled = True
+        else:
+            self._points_enabled = False
+            self._render_mode = self.RENDER_LINE
         self._render_current_view()
+
+    def toggle_points(self) -> bool:
+        self._points_enabled = not self._points_enabled
+        self._render_mode = self.RENDER_POINTS if self._points_enabled else self.RENDER_LINE
+        self._render_current_view()
+        return self._points_enabled
+
+    def toggle_smoothing(self) -> bool:
+        self._smooth_enabled = not self._smooth_enabled
+        self._render_current_view()
+        return self._smooth_enabled
 
     def toggle_normalization(self) -> bool:
         self._normalization_enabled = not self._normalization_enabled
@@ -173,6 +258,7 @@ class LivePlotter:
         self._cursor_probe_enabled = not self._cursor_probe_enabled
         if not self._cursor_probe_enabled:
             self._hide_cursor_guides()
+            self._last_hover_label = ""
         self.canvas.draw_idle()
         return self._cursor_probe_enabled
 
@@ -250,8 +336,88 @@ class LivePlotter:
             "stage_range": self._stage_window(),
         }
 
-    def update(self, record: MeasurementRecord) -> None:
-        self.timestamps.append(datetime.fromisoformat(record.timestamp))
+    def furnace_summary(self) -> dict[str, str]:
+        return summarize_furnace_profile(self._get_heating_profile())
+
+    def set_noise_reduction(self, config: NoiseReductionConfig) -> None:
+        self._noise_reduction = config
+        self._heating_profile_dirty = True
+        self._render_current_view()
+
+    def noise_reduction_config(self) -> NoiseReductionConfig:
+        return self._noise_reduction
+
+    def auto_configure_noise_reduction(self, target_series: str = "all") -> NoiseReductionConfig:
+        config = auto_noise_reduction(self._series_for_noise_target(target_series))
+        config.target_series = target_series
+        self.set_noise_reduction(config)
+        return config
+
+    def _series_for_noise_target(self, target_series: str) -> list[float]:
+        if target_series == "mass":
+            return list(self.masses)
+        if target_series == "temperature":
+            return list(self.temperatures)
+        if target_series == "thermocouple":
+            return list(self.thermocouple_temperatures)
+        return [
+            value
+            for series in (
+                self.masses,
+                self.temperatures,
+                self.thermocouple_temperatures,
+            )
+            for value in series
+        ]
+
+    def begin_point_pick(self, callback) -> None:
+        self._point_pick_callback = callback
+        self._time_span_pick_callback = None
+        self._time_span_pick_start = None
+        self._time_span_hover = None
+
+    def begin_time_span_pick(self, callback) -> None:
+        self._time_span_pick_callback = callback
+        self._point_pick_callback = None
+        self._time_span_pick_start = None
+        self._time_span_hover = None
+        self._render_current_view()
+
+    def cancel_interactive_pick(self) -> None:
+        self._point_pick_callback = None
+        self._time_span_pick_callback = None
+        self._time_span_pick_start = None
+        self._time_span_hover = None
+        self._render_current_view()
+
+    def sync_marker_a_to_timestamp(self, raw_timestamp: str | None) -> None:
+        self._sync_marker_to_timestamp("A", raw_timestamp)
+
+    def sync_marker_b_to_timestamp(self, raw_timestamp: str | None) -> None:
+        self._sync_marker_to_timestamp("B", raw_timestamp)
+
+    def _sync_marker_to_timestamp(self, label: str, raw_timestamp: str | None) -> None:
+        if not raw_timestamp or not self.mass_timestamps:
+            return
+        target = self._coerce_datetime(raw_timestamp)
+        if target is None:
+            return
+        candidates = [
+            (index, abs((timestamp - target).total_seconds()))
+            for index, timestamp in enumerate(self.mass_timestamps)
+            if index < len(self.masses) and not math.isnan(self.masses[index])
+        ]
+        if not candidates:
+            return
+        self._marker_indices[label] = min(candidates, key=lambda item: item[1])[0]
+        if self._markers_enabled:
+            self._render_current_view()
+
+    def update(self, record: MeasurementRecord, *, render: bool = True) -> None:
+        timestamp = self._coerce_datetime(record.timestamp)
+        if timestamp is None:
+            return
+        self.timestamps.append(timestamp)
         self._append_series_sample(self.mass_timestamps, self.masses, record.mass_timestamp, record.mass)
         previous_temp_points = len(self.temperature_timestamps)
         previous_thermocouple_points = len(self.thermocouple_timestamps)
@@ -259,8 +425,15 @@ class LivePlotter:
         self._append_series_sample(self.thermocouple_timestamps, self.thermocouple_temperatures, record.furnace_sv_timestamp, record.furnace_sv)
         if len(self.temperature_timestamps) != previous_temp_points or len(self.thermocouple_timestamps) != previous_thermocouple_points:
             self._heating_profile_dirty = True
-        if self._display_paused:
+        if not render:
             return
+        self._render_current_view()
+
+    def extend(self, records: list[MeasurementRecord]) -> None:
+        if not records:
+            return
+        for record in records:
+            self.update(record, render=False)
         self._render_current_view()
 
     def clear(self) -> None:
@@ -393,6 +566,7 @@ class LivePlotter:
         self.figure.subplots_adjust(left=0.08, right=0.9, top=0.93, bottom=0.08, hspace=0.12)
         if self._viewport_locked:
             self._apply_saved_viewport()
+        self._restore_hover_guides()
         self.canvas.draw_idle()
 
     def _draw_combined_view(self) -> None:
@@ -405,15 +579,15 @@ class LivePlotter:
         self._set_axis_role(ax_temp, "temp")
         self._style_axis(ax_mass, ylabel=self._mass_axis_label(), color=self._plot_theme.mass_label)
         self._style_axis(ax_temp, ylabel="Температура (°C)", color=self._plot_theme.temp_label, secondary=True)
-        ax_mass.set_xlabel("Время", color=self._plot_theme.x_label, fontsize=self._label_size)
+        ax_mass.set_xlabel(self._time_axis_label(), color=self._plot_theme.x_label, fontsize=self._label_size)
         handles = []
         mass_values = self.mass_series_values()
-        temp_values = self._series_values(list(self.temperatures))
-        sv_values = self._series_values(list(self.thermocouple_temperatures))
+        temp_values = self._series_values(list(self.temperatures), series_key="temperature")
+        sv_values = self._series_values(list(self.thermocouple_temperatures), series_key="thermocouple")
         if self.is_series_visible("mass"):
             handles.append(self._draw_series(ax_mass, list(self.mass_timestamps), mass_values, "mass", self._legend_label("Масса", mass_values, self._mass_unit())))
         if self.is_series_visible("temperature"):
-            handles.append(self._draw_series(ax_temp, list(self.temperature_timestamps), temp_values, "temperature", self._legend_label("Камера", temp_values, "°C")))
+            handles.append(self._draw_series(ax_temp, list(self.temperature_timestamps), temp_values, "temperature", self._legend_label("t Камера PV", temp_values, "°C")))
         if self.is_series_visible("thermocouple"):
             handles.append(self._draw_series(ax_temp, list(self.thermocouple_timestamps), sv_values, "thermocouple", self._legend_label("Термопара", sv_values, "°C")))
         heating_profile_handle = self._draw_heating_profile(ax_temp)
@@ -436,16 +610,16 @@ class LivePlotter:
         self._set_axis_role(ax_temp, "temp")
         self._style_axis(ax_mass, ylabel=self._mass_axis_label(), color=self._plot_theme.mass_label)
         self._style_axis(ax_temp, ylabel="Температура (°C)", color=self._plot_theme.temp_label)
-        ax_temp.set_xlabel("Время", color=self._plot_theme.x_label, fontsize=self._label_size)
+        ax_temp.set_xlabel(self._time_axis_label(), color=self._plot_theme.x_label, fontsize=self._label_size)
         mass_values = self.mass_series_values()
-        temp_values = self._series_values(list(self.temperatures))
-        sv_values = self._series_values(list(self.thermocouple_temperatures))
+        temp_values = self._series_values(list(self.temperatures), series_key="temperature")
+        sv_values = self._series_values(list(self.thermocouple_temperatures), series_key="thermocouple")
         mass_handles = []
         temp_handles = []
         if self.is_series_visible("mass"):
             mass_handles.append(self._draw_series(ax_mass, list(self.mass_timestamps), mass_values, "mass", self._legend_label("Масса", mass_values, self._mass_unit())))
         if self.is_series_visible("temperature"):
-            temp_handles.append(self._draw_series(ax_temp, list(self.temperature_timestamps), temp_values, "temperature", self._legend_label("Камера", temp_values, "°C")))
+            temp_handles.append(self._draw_series(ax_temp, list(self.temperature_timestamps), temp_values, "temperature", self._legend_label("t Камера PV", temp_values, "°C")))
         if self.is_series_visible("thermocouple"):
             temp_handles.append(self._draw_series(ax_temp, list(self.thermocouple_timestamps), sv_values, "thermocouple", self._legend_label("Термопара", sv_values, "°C")))
         heating_profile_handle = self._draw_heating_profile(ax_temp)
@@ -465,7 +639,7 @@ class LivePlotter:
         self.axes = [axis]
         self.ax_main = axis
         self._set_axis_role(axis, "mass" if series == "mass" else "temp")
-        axis.set_xlabel("Время", color=self._plot_theme.x_label, fontsize=self._label_size)
+        axis.set_xlabel(self._time_axis_label(), color=self._plot_theme.x_label, fontsize=self._label_size)
         handles = []
         if series == "mass":
             values = self.mass_series_values()
@@ -475,11 +649,11 @@ class LivePlotter:
             self._apply_analysis_overlays(axis, None)
             title = "График массы"
         else:
-            values = self._series_values(list(self.temperatures))
-            sv_values = self._series_values(list(self.thermocouple_temperatures))
+            values = self._series_values(list(self.temperatures), series_key="temperature")
+            sv_values = self._series_values(list(self.thermocouple_temperatures), series_key="thermocouple")
             self._style_axis(axis, ylabel="Температура (°C)", color=self._plot_theme.temp_label)
             if self.is_series_visible("temperature"):
-                handles.append(self._draw_series(axis, list(self.temperature_timestamps), values, "temperature", self._legend_label("Камера", values, "°C")))
+                handles.append(self._draw_series(axis, list(self.temperature_timestamps), values, "temperature", self._legend_label("t Камера PV", values, "°C")))
             if self.is_series_visible("thermocouple"):
                 handles.append(self._draw_series(axis, list(self.thermocouple_timestamps), sv_values, "thermocouple", self._legend_label("Термопара", sv_values, "°C")))
             heating_profile_handle = self._draw_heating_profile(axis)
@@ -502,11 +676,11 @@ class LivePlotter:
         self._set_axis_role(ax_mass, "delta_mass")
         self._set_axis_role(ax_temp, "delta_temp")
         mass_values = self._delta_values(self.mass_series_values())
-        temp_values = self._delta_values(list(self.temperatures))
-        sv_values = self._delta_values(list(self.thermocouple_temperatures))
+        temp_values = self._delta_values(list(self.temperatures), series_key="temperature")
+        sv_values = self._delta_values(list(self.thermocouple_temperatures), series_key="thermocouple")
         self._style_axis(ax_mass, ylabel=f"ΔМасса ({self._mass_unit()})", color=self._plot_theme.mass_label)
         self._style_axis(ax_temp, ylabel="ΔТемпература (°C)", color=self._plot_theme.temp_label)
-        ax_temp.set_xlabel("Время", color=self._plot_theme.x_label, fontsize=self._label_size)
+        ax_temp.set_xlabel(self._time_axis_label(), color=self._plot_theme.x_label, fontsize=self._label_size)
         mass_handles = []
         temp_handles = []
         if self.is_series_visible("mass"):
@@ -533,7 +707,7 @@ class LivePlotter:
         self._set_axis_role(axis, "dtg")
         values = self._dtg_values(list(self.mass_timestamps), self.mass_series_values())
         self._style_axis(axis, ylabel=f"DTG ({self._dtg_unit()})", color=self._plot_theme.mass_label)
-        axis.set_xlabel("Время", color=self._plot_theme.x_label, fontsize=self._label_size)
+        axis.set_xlabel(self._time_axis_label(), color=self._plot_theme.x_label, fontsize=self._label_size)
         handles = []
         if self.is_series_visible("mass"):
             handles.append(self._draw_series(axis, list(self.mass_timestamps), values, "mass", self._legend_label("DTG", values, self._dtg_unit())))
@@ -577,7 +751,27 @@ class LivePlotter:
             axis.yaxis.set_label_coords(1.09, 0.5)
 
     def _style_time_axis(self, axis) -> None:
-        axis.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+        if self._relative_time_axis and self.timestamps:
+            base = self._coerce_datetime(self.timestamps[0])
+            if base is None:
+                axis.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+                return
+
+            def formatter(x_value, _pos=None):
+                current = self._coerce_datetime(mdates.num2date(x_value))
+                if current is None:
+                    return ""
+                delta = max(0, int(round((current - base).total_seconds())))
+                hours, rem = divmod(delta, 3600)
+                minutes, seconds = divmod(rem, 60)
+                return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+            axis.xaxis.set_major_formatter(mticker.FuncFormatter(formatter))
+        else:
+            axis.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+
+    def _time_axis_label(self) -> str:
+        return "Время"
 
     def _style_legend(self, axis, handles) -> None:
         if not handles:
@@ -593,51 +787,18 @@ class LivePlotter:
             self._draw_markers(mass_axis)
 
     def _legend_label(self, base: str, values: list[float], unit: str) -> str:
-        last_value = self._last_finite(values)
-        if last_value is None:
-            return f"{base}: -- {unit}"
-        digits = 1 if unit == "°C" else 2 if "%" in unit else 3
-        return f"{base}: {last_value:.{digits}f} {unit}"
+        return build_legend_label(base, values, unit, self._last_finite(values))
 
     def _series_display_name(self, series_key: str) -> str:
-        if self._view_mode == self.VIEW_DTG and series_key == "mass":
-            return "DTG"
-        names = {
-            "mass": "Масса, %" if self._normalization_enabled else "Масса",
-            "temperature": "Камера",
-            "thermocouple": "Термопара",
-            "heating_profile": "Профиль нагрева",
-        }
-        return names.get(series_key, series_key)
+        return series_display_name(
+            self._view_mode, self._normalization_enabled, series_key, self.VIEW_DTG
+        )
 
     def _series_style(self, series_key: str) -> dict[str, object]:
-        styles = {
-            "mass": {"color": self._plot_theme.mass_line, "linestyle": "-", "linewidth": 2.15},
-            "temperature": {"color": self._plot_theme.temp_line, "linestyle": "-", "linewidth": 2.15},
-            "thermocouple": {"color": "#F6A04D", "linestyle": "-", "linewidth": 2.15},
-            "heating_profile": {"color": "#101010", "linestyle": "-", "linewidth": 2.85},
-        }
-        result = styles.get(series_key, styles["temperature"]).copy()
-        if series_key != "heating_profile":
-            result.update(self._sanitize_series_style(self._series_style_overrides.get(series_key, {})))
-        return result
+        return series_style(self._plot_theme, series_key, self._series_style_overrides)
 
     def _sanitize_series_style(self, style: dict[str, object] | None) -> dict[str, object]:
-        if not style:
-            return {}
-        sanitized: dict[str, object] = {}
-        color = str(style.get("color", "")).strip()
-        if color:
-            sanitized["color"] = color
-        linestyle = str(style.get("linestyle", "")).strip().lower()
-        if linestyle in {"-", "--", "solid", "dashed"}:
-            sanitized["linestyle"] = "-" if linestyle in {"-", "solid"} else "--"
-        try:
-            linewidth = float(style.get("linewidth", 2.15))
-        except (TypeError, ValueError):
-            linewidth = 2.15
-        sanitized["linewidth"] = min(4.5, max(0.8, linewidth))
-        return sanitized
+        return sanitize_series_style(style)
 
     def _mass_unit(self) -> str:
         return "%" if self._normalization_enabled else "г"
@@ -656,13 +817,6 @@ class LivePlotter:
         return self._get_heating_profile().has_data
 
     def _temperature_source_data(self) -> tuple[list[datetime], list[float], str]:
-        thermocouple_points = [
-            (timestamp, value)
-            for timestamp, value in zip(self.thermocouple_timestamps, self.thermocouple_temperatures)
-            if not math.isnan(value)
-        ]
-        if len(thermocouple_points) >= 6:
-            return [item[0] for item in thermocouple_points], [item[1] for item in thermocouple_points], "thermocouple"
         camera_points = [
             (timestamp, value)
             for timestamp, value in zip(self.temperature_timestamps, self.temperatures)
@@ -670,6 +824,13 @@ class LivePlotter:
         ]
         if len(camera_points) >= 6:
             return [item[0] for item in camera_points], [item[1] for item in camera_points], "temperature"
+        thermocouple_points = [
+            (timestamp, value)
+            for timestamp, value in zip(self.thermocouple_timestamps, self.thermocouple_temperatures)
+            if not math.isnan(value)
+        ]
+        if len(thermocouple_points) >= 6:
+            return [item[0] for item in thermocouple_points], [item[1] for item in thermocouple_points], "thermocouple"
         return [], [], "temperature"
 
     def _get_heating_profile(self) -> HeatingProfileResult:
@@ -680,11 +841,17 @@ class LivePlotter:
         source_timestamps, source_values, source_series = self._temperature_source_data()
         self._heating_profile_result = build_heating_profile(
             source_timestamps,
-            source_values,
+            self._filtered_values(source_values, series_key=source_series),
             source_series=source_series,
         )
         self._heating_profile_dirty = False
         return self._heating_profile_result
+
+    def _filtered_values(self, values: list[float], *, series_key: str = "all") -> list[float]:
+        target = self._noise_reduction.target_series
+        if target not in {"all", series_key}:
+            return list(values)
+        return apply_noise_reduction(values, self._noise_reduction)
 
     def _draw_heating_profile(self, axis):
         if not self.is_series_visible("heating_profile"):
@@ -701,10 +868,7 @@ class LivePlotter:
         )
 
     def _normalize_mass_values(self, values: list[float]) -> list[float]:
-        baseline = self._first_finite(values)
-        if baseline in {None, 0.0}:
-            return values
-        return [math.nan if math.isnan(value) else (value / baseline) * 100.0 for value in values]
+        return normalize_mass_values(values)
 
     def _draw_markers(self, axis) -> None:
         marker_data = self._marker_positions()
@@ -743,9 +907,7 @@ class LivePlotter:
         bounds = self._stage_bounds()
         if bounds is None:
             return
-        start_idx, end_idx = bounds
-        start_time = self.mass_timestamps[start_idx]
-        end_time = self.mass_timestamps[end_idx]
+        start_time, end_time = bounds
         for axis in (mass_axis, temp_axis):
             if axis is not None:
                 axis.axvspan(start_time, end_time, color="#E8B04A", alpha=0.12)
@@ -770,8 +932,8 @@ class LivePlotter:
         return [("A", self.mass_timestamps[first_idx], values[first_idx]), ("B", self.mass_timestamps[last_idx], values[last_idx])]
 
     def _marker_metrics(self) -> dict[str, str]:
-        raw_mass = list(self.masses)
-        temps = list(self.temperatures)
+        raw_mass = self._filtered_values(list(self.masses), series_key="mass")
+        temps = self._filtered_values(list(self.temperatures), series_key="temperature")
         self._ensure_marker_indices()
         first_idx = self._marker_indices.get("A")
         last_idx = self._marker_indices.get("B")
@@ -815,11 +977,13 @@ class LivePlotter:
     def _nearest_mass_index_by_x(self, x_value: float) -> int | None:
         if not self.mass_timestamps:
             return None
-        target = mdates.num2date(x_value).replace(tzinfo=None)
+        target = self._coerce_datetime(mdates.num2date(x_value))
+        if target is None:
+            return None
         candidates = [
-            (idx, abs((timestamp.replace(tzinfo=None) - target).total_seconds()))
+            (idx, abs((self._coerce_datetime(timestamp) - target).total_seconds()))
             for idx, timestamp in enumerate(self.mass_timestamps)
-            if idx < len(self.masses) and not math.isnan(self.masses[idx])
+            if idx < len(self.masses) and not math.isnan(self.masses[idx]) and self._coerce_datetime(timestamp) is not None
         ]
         if not candidates:
             return None
@@ -844,48 +1008,48 @@ class LivePlotter:
         peak = max(finite, key=lambda item: abs(item))
         return f"{peak:.4f} {self._dtg_unit()}"
 
-    def _stage_bounds(self) -> tuple[int, int] | None:
+    def _stage_bounds(self) -> tuple[datetime, datetime] | None:
         dtg = self._dtg_values(list(self.mass_timestamps), self.mass_series_values())
         finite = [(index, abs(value)) for index, value in enumerate(dtg) if not math.isnan(value)]
-        if len(finite) < 3:
-            return None
-        peak_index, peak_value = max(finite, key=lambda item: item[1])
-        threshold = peak_value * 0.18
-        start = peak_index
-        end = peak_index
-        while start > 0 and not math.isnan(dtg[start - 1]) and abs(dtg[start - 1]) >= threshold:
-            start -= 1
-        while end < len(dtg) - 1 and not math.isnan(dtg[end + 1]) and abs(dtg[end + 1]) >= threshold:
-            end += 1
-        return start, end
+        if len(finite) >= 3 and self.mass_timestamps:
+            peak_index, peak_value = max(finite, key=lambda item: item[1])
+            threshold = peak_value * 0.18
+            start = peak_index
+            end = peak_index
+            while start > 0 and not math.isnan(dtg[start - 1]) and abs(dtg[start - 1]) >= threshold:
+                start -= 1
+            while end < len(dtg) - 1 and not math.isnan(dtg[end + 1]) and abs(dtg[end + 1]) >= threshold:
+                end += 1
+            return self.mass_timestamps[start], self.mass_timestamps[end]
+        profile = self._get_heating_profile()
+        if profile.has_data and profile.start_index is not None and profile.stable_index is not None:
+            return profile.timestamps[profile.start_index], profile.timestamps[profile.stable_index]
+        return None
 
     def _stage_window(self) -> str:
         bounds = self._stage_bounds()
         if bounds is None:
             return "--"
         start, end = bounds
-        return f"{self.mass_timestamps[start].strftime('%H:%M:%S')} - {self.mass_timestamps[end].strftime('%H:%M:%S')}"
+        return f"{start.strftime('%H:%M:%S')} - {end.strftime('%H:%M:%S')}"
 
     def _first_finite(self, values: list[float]) -> float | None:
-        for value in values:
-            if not math.isnan(value):
-                return value
-        return None
+        return first_finite(values)
 
     def _first_finite_index(self, values: list[float]) -> int | None:
-        for index, value in enumerate(values):
-            if not math.isnan(value):
-                return index
-        return None
+        return first_finite_index(values)
 
     def _last_finite_index(self, values: list[float]) -> int | None:
-        for index in range(len(values) - 1, -1, -1):
-            if not math.isnan(values[index]):
-                return index
-        return None
+        return last_finite_index(values)
 
     def _sync_time_limits(self) -> None:
         if not self.axes:
+            return
+        if self._plot_range_mode == self.RANGE_SEGMENT and self.timestamps:
+            right = self.timestamps[-1] + timedelta(seconds=self._x_pad_seconds)
+            left = right - timedelta(seconds=max(10.0, self._manual_x_seconds))
+            for axis in self.axes:
+                axis.set_xlim(left, right)
             return
         if len(self.timestamps) == 1:
             center = self.timestamps[0]
@@ -901,6 +1065,7 @@ class LivePlotter:
 
     def _apply_scale_limits(self) -> None:
         self._sync_time_limits()
+        self._draw_selection_overlay()
         if not self.axes:
             return
         if self._autoscale_enabled:
@@ -938,8 +1103,12 @@ class LivePlotter:
     def _apply_manual_limits(self) -> None:
         if not self.timestamps:
             return
-        right = self.timestamps[-1] + timedelta(seconds=self._x_pad_seconds)
-        left = right - timedelta(seconds=self._manual_x_seconds)
+        if self._plot_range_mode == self.RANGE_FULL:
+            left = self.timestamps[0] - timedelta(seconds=self._x_pad_seconds)
+            right = self.timestamps[-1] + timedelta(seconds=self._x_pad_seconds)
+        else:
+            right = self.timestamps[-1] + timedelta(seconds=self._x_pad_seconds)
+            left = right - timedelta(seconds=self._manual_x_seconds)
         for axis in self.axes:
             axis.set_xlim(left, right)
             lines = [line for line in axis.get_lines() if not getattr(line, "_df_ignore_scale", False)]
@@ -955,7 +1124,9 @@ class LivePlotter:
                         continue
                     if math.isnan(y_num):
                         continue
-                    point_time = mdates.num2date(x_num).replace(tzinfo=None)
+                    point_time = self._coerce_datetime(mdates.num2date(x_num))
+                    if point_time is None:
+                        continue
                     if left <= point_time <= right:
                         finite_values.append(y_num)
             if not finite_values:
@@ -966,45 +1137,29 @@ class LivePlotter:
                 ymin = ymax - max(1.0, self._manual_y_span)
             axis.set_ylim(ymin, ymax)
 
-    def _series_values(self, values: list[float]) -> list[float]:
-        return self._smooth_values(values) if self._render_mode == self.RENDER_SMOOTH else values
+    def _series_values(self, values: list[float], *, series_key: str = "all") -> list[float]:
+        return build_series_values(
+            self._filtered_values(values, series_key=series_key),
+            smooth=self._smooth_enabled,
+        )
 
     def mass_series_values(self) -> list[float]:
-        values = list(self.masses)
-        if self._normalization_enabled:
-            values = self._normalize_mass_values(values)
-        return self._smooth_values(values) if self._render_mode == self.RENDER_SMOOTH else values
+        return build_mass_series_values(
+            self._filtered_values(list(self.masses), series_key="mass"),
+            normalized=self._normalization_enabled,
+            smooth=self._smooth_enabled,
+        )
 
-    def _delta_values(self, values: list[float]) -> list[float]:
-        result: list[float] = []
-        previous: float | None = None
-        for value in values:
-            if math.isnan(value):
-                result.append(math.nan)
-                previous = None
-                continue
-            result.append(math.nan if previous is None else value - previous)
-            previous = value
-        return self._smooth_values(result) if self._render_mode == self.RENDER_SMOOTH else result
+    def _delta_values(self, values: list[float], *, series_key: str = "all") -> list[float]:
+        return build_delta_values(
+            self._filtered_values(values, series_key=series_key),
+            smooth=self._smooth_enabled,
+        )
 
     def _dtg_values(self, timestamps: list[datetime], values: list[float]) -> list[float]:
-        result: list[float] = []
-        previous_value: float | None = None
-        previous_time: datetime | None = None
-        for timestamp, value in zip(timestamps, values):
-            if math.isnan(value):
-                result.append(math.nan)
-                previous_value = None
-                previous_time = None
-                continue
-            if previous_value is None or previous_time is None:
-                result.append(math.nan)
-            else:
-                delta_minutes = (timestamp - previous_time).total_seconds() / 60.0
-                result.append(math.nan if delta_minutes <= 0 else (value - previous_value) / delta_minutes)
-            previous_value = value
-            previous_time = timestamp
-        return self._smooth_values(result) if self._render_mode == self.RENDER_SMOOTH else result
+        return build_dtg_values(
+            timestamps, values, smooth=self._smooth_enabled
+        )
 
     def _append_series_sample(
         self,
@@ -1013,30 +1168,24 @@ class LivePlotter:
         raw_timestamp: str | None,
         raw_value: float | None,
     ) -> None:
-        if raw_timestamp is None:
-            return
-        try:
-            timestamp = datetime.fromisoformat(raw_timestamp)
-        except ValueError:
-            return
-        if target_timestamps and target_timestamps[-1] == timestamp:
-            return
-        target_timestamps.append(timestamp)
-        target_values.append(raw_value if raw_value is not None else math.nan)
+        append_series_sample(target_timestamps, target_values, raw_timestamp, raw_value)
 
     def _smooth_values(self, values: list[float], window: int = 5) -> list[float]:
-        if window <= 1:
-            return values
-        result: list[float] = []
-        for index in range(len(values)):
-            chunk = [value for value in values[max(0, index - window + 1): index + 1] if not math.isnan(value)]
-            result.append(sum(chunk) / len(chunk) if chunk else math.nan)
-        return result
+        return smooth_values(values, window=window)
 
     def _render_style(self) -> dict[str, float | str]:
-        if self._render_mode == self.RENDER_POINTS:
+        if self._points_enabled:
             return {"marker": "o", "markersize": max(3.8, 4.6 * self._scale), "alpha": 0.9}
         return {"marker": "", "markersize": 0.0, "alpha": 0.95}
+
+    def _draw_selection_overlay(self) -> None:
+        if not self.axes or self._time_span_pick_start is None:
+            return
+        end = self._time_span_hover or self._time_span_pick_start
+        left = mdates.date2num(min(self._time_span_pick_start, end))
+        right = mdates.date2num(max(self._time_span_pick_start, end))
+        for axis in self.axes:
+            axis.axvspan(left, right, color="#4AB8A1", alpha=0.12, zorder=1)
 
     def _zoom_axes(self, factor: float) -> None:
         if factor <= 0 or not self.axes:
@@ -1088,15 +1237,47 @@ class LivePlotter:
             label.set_visible(False)
 
     def _cursor_text(self, axis, x_value: float, y_value: float) -> str:
-        timestamp = mdates.num2date(x_value)
-        role = self._axis_role(axis)
-        if role == "dtg":
-            unit = self._dtg_unit()
-        elif "temp" in role:
-            unit = "°C"
+        timestamp = self._coerce_datetime(mdates.num2date(x_value))
+        if timestamp is None:
+            return f"--\n{y_value:.3f}"
+        if self._relative_time_axis and self.timestamps:
+            base_time = self._coerce_datetime(self.timestamps[0])
+            if base_time is None:
+                time_text = timestamp.strftime("%H:%M:%S")
+            else:
+                delta = max(0, int(round((timestamp - base_time).total_seconds())))
+                hours, rem = divmod(delta, 3600)
+                minutes, seconds = divmod(rem, 60)
+                time_text = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
         else:
-            unit = self._mass_unit()
-        return f"{timestamp.strftime('%H:%M:%S')}\n{y_value:.3f} {unit}"
+            time_text = timestamp.strftime("%H:%M:%S")
+        lines = [f"Время: {time_text}"]
+        metric_map = [
+            ("mass", self.mass_timestamps, self.mass_series_values(), f"Масса: {{value:.3f}} {self._mass_unit()}"),
+            ("temperature", self.temperature_timestamps, self._series_values(list(self.temperatures), series_key="temperature"), "t Камера PV: {value:.1f} °C"),
+            ("thermocouple", self.thermocouple_timestamps, self._series_values(list(self.thermocouple_temperatures), series_key="thermocouple"), "Термопара SV: {value:.1f} °C"),
+        ]
+        for series_key, timestamps, values, template in metric_map:
+            if not self.is_series_visible(series_key):
+                continue
+            nearest = self._nearest_series_value(timestamp, timestamps, values)
+            if nearest is None or math.isnan(nearest):
+                continue
+            lines.append(template.format(value=nearest))
+        return "\n".join(lines)
+
+    def _nearest_series_value(self, target: datetime, timestamps: list[datetime], values: list[float]) -> float | None:
+        candidates = [
+            (abs((timestamp - target).total_seconds()), value)
+            for timestamp, value in zip(timestamps, values)
+            if not math.isnan(value)
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: item[0])[1]
+
+    def _coerce_datetime(self, value: str | datetime | None) -> datetime | None:
+        return coerce_timestamp(value)
 
     def _draw_cursor_anchors(self) -> None:
         for anchor in self._cursor_anchor_points:
@@ -1106,7 +1287,27 @@ class LivePlotter:
             axis.scatter([anchor["x"]], [anchor["y"]], color=self._plot_theme.title, s=18, zorder=6)
             axis.annotate(str(anchor["text"]), xy=(anchor["x"], anchor["y"]), xytext=(10, -10), textcoords="offset points", fontsize=max(8, self._tick_size), color=self._plot_theme.legend_text, bbox={"boxstyle": "round,pad=0.2", "fc": self._plot_theme.legend_bg, "ec": self._plot_theme.legend_edge, "alpha": 0.96})
 
+    def _restore_hover_guides(self) -> None:
+        if not self._cursor_probe_enabled or not self._last_hover_label:
+            return
+        if (time.monotonic() - self._last_hover_at) > 0.8:
+            return
+        axis = self.ax_main or (self.axes[0] if self.axes else None)
+        if axis is None:
+            return
+        guides = self._ensure_cursor_guides(axis)
+        guides[2].set_text(self._last_hover_label)
+        guides[2].xy = (0, 0)
+        guides[2].set_position((12, 12))
+        guides[2].set_visible(True)
+
     def _on_mouse_move(self, event) -> None:
+        if self._time_span_pick_callback is not None and event.inaxes is not None and event.xdata is not None:
+            hover = self._coerce_datetime(mdates.num2date(event.xdata))
+            if hover is not None and hover != self._time_span_hover:
+                self._time_span_hover = hover
+                self._render_current_view()
+            return
         if self._markers_enabled and event.inaxes is not None and event.x is not None and event.y is not None:
             picked = self._pick_marker_label(event)
             try:
@@ -1125,18 +1326,22 @@ class LivePlotter:
             except Exception:
                 pass
         if not self._cursor_probe_enabled or event.inaxes is None or event.xdata is None or event.ydata is None:
-            self._hide_cursor_guides()
-            self.canvas.draw_idle()
+            if (time.monotonic() - self._last_hover_at) > 0.8:
+                self._hide_cursor_guides()
+                self.canvas.draw_idle()
             return
         self._hide_cursor_guides()
         vline, hline, label = self._ensure_cursor_guides(event.inaxes)
         vline.set_xdata([event.xdata, event.xdata])
         hline.set_ydata([event.ydata, event.ydata])
         label.xy = (event.xdata, event.ydata)
-        label.set_text(self._cursor_text(event.inaxes, event.xdata, event.ydata))
+        hover_text = self._cursor_text(event.inaxes, event.xdata, event.ydata)
+        label.set_text(hover_text)
         vline.set_visible(True)
         hline.set_visible(True)
         label.set_visible(True)
+        self._last_hover_label = hover_text
+        self._last_hover_at = time.monotonic()
         self.canvas.draw_idle()
 
     def _on_axes_leave(self, _event) -> None:
@@ -1145,6 +1350,43 @@ class LivePlotter:
             self.canvas.draw_idle()
 
     def _on_mouse_click(self, event) -> None:
+        if getattr(event, "button", None) == 3 and self._zoom_active:
+            self.reset_view()
+            return
+        if self._time_span_pick_callback is not None and event.inaxes is not None and event.xdata is not None:
+            if getattr(event, "button", None) == 3:
+                self.cancel_interactive_pick()
+                return
+            picked = self._coerce_datetime(mdates.num2date(event.xdata))
+            if picked is None:
+                return
+            if self._time_span_pick_start is None:
+                self._time_span_pick_start = picked
+                self._time_span_hover = picked
+                self._render_current_view()
+                return
+            callback = self._time_span_pick_callback
+            start = self._time_span_pick_start
+            self._time_span_pick_callback = None
+            self._time_span_pick_start = None
+            self._time_span_hover = None
+            self._render_current_view()
+            callback(min(start, picked), max(start, picked))
+            return
+        if self._point_pick_callback is not None and event.inaxes is not None and event.xdata is not None:
+            nearest_idx = self._nearest_mass_index_by_x(event.xdata)
+            if nearest_idx is None:
+                return
+            callback = self._point_pick_callback
+            self._point_pick_callback = None
+            callback(
+                {
+                    "index": nearest_idx,
+                    "timestamp": self.mass_timestamps[nearest_idx],
+                    "mass": self.masses[nearest_idx],
+                }
+            )
+            return
         if self._markers_enabled and event.inaxes is not None and event.xdata is not None:
             picked = self._pick_marker_label(event)
             if getattr(event, "button", None) == 3 and picked is not None:
@@ -1231,7 +1473,4 @@ class LivePlotter:
 
     @staticmethod
     def _last_finite(values: list[float]) -> float | None:
-        for value in reversed(values):
-            if not math.isnan(value):
-                return value
-        return None
+        return last_finite(values)

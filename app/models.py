@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import field
+
+from app.compat import dataclass
 
 
 @dataclass(slots=True)
@@ -28,6 +30,8 @@ class FurnaceConfig:
     register_pv: int
     register_sv: int
     scale_factor: float
+    register_mode_pv: int = 3
+    register_mode_sv: int = 3
     driver: str = "generic_modbus"
     access_mode: str = "read_only"
     read_groups: list[dict[str, object]] = field(default_factory=list)
@@ -74,6 +78,8 @@ class ApplicationConfig:
     plot_manual_x_seconds: float = 600.0
     plot_manual_y_span: float = 250.0
     plot_y_headroom: float = 50.0
+    plot_x_tick_seconds: float = 600.0
+    plot_y_tick_step: float = 50.0
 
 
 @dataclass(slots=True)

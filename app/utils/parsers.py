@@ -16,9 +16,17 @@ MASS_PATTERNS = (
 )
 
 
-def parse_mass_line(raw_line: str, logger: logging.Logger | None = None) -> float | None:
+def parse_mass_line(
+    raw_line: str, logger: logging.Logger | None = None
+) -> float | None:
     cleaned = sanitize_ascii_line(raw_line)
     if not cleaned:
+        return None
+
+    cleaned_lower = cleaned.lower()
+    if "err" in cleaned_lower or "error" in cleaned_lower:
+        if logger is not None:
+            logger.warning("Строка весов содержит маркер ошибки и пропущена: %r", cleaned)
         return None
 
     for pattern in MASS_PATTERNS:

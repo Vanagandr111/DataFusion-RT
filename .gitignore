@@ -5,6 +5,7 @@ __pycache__/
 
 # Virtual environments
 .venv/
+.venv-win7-32/
 venv/
 env/
 ENV/
@@ -12,6 +13,8 @@ ENV/
 # Build / packaging
 build/
 dist/
+dist-win7-x86/
+dist-win7-x86-tmp/
 *.spec
 *.egg-info/
 .eggs/
@@ -30,6 +33,8 @@ htmlcov/
 # IDE / editor
 .idea/
 .vscode/
+.obsidian/
+.qwen/
 *.code-workspace
 *.suo
 *.user
@@ -48,6 +53,8 @@ data/*
 
 logs/*
 !logs/.gitkeep
+sessions/autosave/*
+sessions/merged/*.json
 
 # Local driver packages
 driver/
@@ -59,6 +66,19 @@ drivers/
 *.xls
 *.xml
 *.png
+
+# Local refactor scratch / duplicate staging
+app/ui_parts/
+app/ui/
+input.txt
+notes/
+index.md
+PROJECT_MEMORY.md
+*.base
+
+# Local toolchains / downloaded runtimes
+tools/downloads/
+tools/python38-win32/
 
 # Keep tracked config, ignore only temporary backups
 config/*.bak

@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 import pandas as pd
+from app.services.excel_support import write_excel_frame
 
 
 class MeasurementExportService:
@@ -18,7 +19,7 @@ class MeasurementExportService:
         except ValueError as exc:
             return False, str(exc)
         except Exception as exc:
-            self.logger.exception("Failed to load measurement data for export.")
+            self.logger.error("Не удалось подготовить данные для экспорта: %s", exc)
             return False, f"Не удалось подготовить данные для экспорта: {exc}"
 
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -28,16 +29,16 @@ class MeasurementExportService:
             if extension == ".csv":
                 frame.to_csv(destination, index=False, encoding="utf-8-sig")
             elif extension == ".xlsx":
-                frame.to_excel(destination, index=False, engine="openpyxl")
+                write_excel_frame(frame, destination)
             elif extension == ".xml":
                 frame.to_xml(destination, index=False, root_name="measurements", row_name="measurement")
             else:
                 return False, f"Неподдерживаемый формат экспорта: {destination.suffix}"
         except ImportError as exc:
-            self.logger.exception("Missing export dependency.")
+            self.logger.warning("Не хватает зависимости для экспорта %s: %s", destination.suffix, exc)
             return False, f"Для экспорта в {destination.suffix} не хватает зависимости: {exc}"
         except Exception as exc:
-            self.logger.exception("Failed to export measurement data to %s", destination)
+            self.logger.error("Ошибка экспорта в %s: %s", destination, exc)
             return False, f"Ошибка экспорта: {exc}"
 
         self.logger.info("Measurements exported to %s", destination)
@@ -54,16 +55,16 @@ class MeasurementExportService:
             if extension == ".csv":
                 frame.to_csv(destination, index=False, encoding="utf-8-sig")
             elif extension == ".xlsx":
-                frame.to_excel(destination, index=False, engine="openpyxl")
+                write_excel_frame(frame, destination)
             elif extension == ".xml":
                 frame.to_xml(destination, index=False, root_name="measurements", row_name="measurement")
             else:
                 return False, f"Неподдерживаемый формат экспорта: {destination.suffix}"
         except ImportError as exc:
-            self.logger.exception("Missing export dependency.")
+            self.logger.warning("Не хватает зависимости для экспорта %s: %s", destination.suffix, exc)
             return False, f"Для экспорта в {destination.suffix} не хватает зависимости: {exc}"
         except Exception as exc:
-            self.logger.exception("Failed to export measurement data to %s", destination)
+            self.logger.error("Ошибка экспорта в %s: %s", destination, exc)
             return False, f"Ошибка экспорта: {exc}"
 
         self.logger.info("Measurements exported to %s", destination)

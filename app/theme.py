@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from tkinter import ttk
 
+from app.compat import dataclass
 
 @dataclass(frozen=True, slots=True)
 class PlotTheme:

@@ -4,15 +4,20 @@ import logging
 import queue
 import threading
 import time
-from datetime import datetime
 
 from app.config import resolve_path
-from app.models import AcquisitionSnapshot, AppConfig, MeasurementRecord
+from app.devices.interfaces import FurnaceReaderProtocol, ScaleReaderProtocol
+from app.devices.models.runtime_state import AcquisitionRuntimeState
+from app.devices.runtime.acquisition_support import (
+    build_acquisition_snapshot,
+    furnace_poll_interval,
+    next_wait_seconds,
+    read_furnace_temperatures,
+    scale_poll_interval,
+)
+from app.devices.runtime.factories import create_furnace_reader, create_scale_reader
+from app.models import AcquisitionSnapshot, AppConfig
 from app.services.data_logger import CSVDataLogger
-from app.services.dk518_reader import DK518Reader
-from app.services.furnace_reader import FurnaceReader
-from app.services.passive_furnace_reader import PassiveFurnaceReader
-from app.services.scale_reader import ScaleReader
 
 
 class AcquisitionController:
@@ -28,16 +33,9 @@ class AcquisitionController:
             resolve_path(self.config.app.csv_path),
             logger=self.logger.getChild("csv"),
         )
-        self._scale_reader: ScaleReader | None = None
-        self._furnace_reader: FurnaceReader | DK518Reader | PassiveFurnaceReader | None = None
-        self._last_mass: float | None = None
-        self._last_furnace_pv: float | None = None
-        self._last_furnace_sv: float | None = None
-        self._last_mass_timestamp: str | None = None
-        self._last_furnace_pv_timestamp: str | None = None
-        self._last_furnace_sv_timestamp: str | None = None
-        self._next_scale_poll_at = 0.0
-        self._next_furnace_poll_at = 0.0
+        self._scale_reader: ScaleReaderProtocol | None = None
+        self._furnace_reader: FurnaceReaderProtocol | None = None
+        self._runtime_state = AcquisitionRuntimeState()
 
     @property
     def running(self) -> bool:
@@ -73,21 +71,9 @@ class AcquisitionController:
             return False
 
         self._stop_event.clear()
-        self._sample_count = 0
-        self._last_mass = None
-        self._last_furnace_pv = None
-        self._last_furnace_sv = None
-        self._last_mass_timestamp = None
-        self._last_furnace_pv_timestamp = None
-        self._last_furnace_sv_timestamp = None
-        self._next_scale_poll_at = 0.0
-        self._next_furnace_poll_at = 0.0
-        self._scale_reader = ScaleReader(
-            self.config.scale,
-            test_mode=self._scale_test_mode_enabled(),
-            logger=self.logger.getChild("scale"),
-        )
-        self._furnace_reader = self._create_furnace_reader()
+        self._runtime_state.reset()
+        self._scale_reader = create_scale_reader(self.config, logger=self.logger)
+        self._furnace_reader = create_furnace_reader(self.config, logger=self.logger)
         self._thread = threading.Thread(
             target=self._run_loop,
             name="labforge-acquisition",
@@ -138,54 +124,36 @@ class AcquisitionController:
             polled_any = False
             try:
                 now = time.monotonic()
-                if self._scale_reader and self.config.scale.enabled and now >= self._next_scale_poll_at:
+                if self._scale_reader and self.config.scale.enabled and now >= self._runtime_state.next_scale_poll_at:
                     mass = self._scale_reader.read_mass()
                     polled_any = True
-                    self._next_scale_poll_at = now + self._scale_poll_interval()
-                    if mass is not None:
-                        self._last_mass = mass
-                        self._last_mass_timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
+                    self._runtime_state.next_scale_poll_at = now + scale_poll_interval(self.config)
+                    self._runtime_state.record_mass(mass)
 
-                if self._furnace_reader and self.config.furnace.enabled and now >= self._next_furnace_poll_at:
-                    pv, sv = self._read_furnace_temperatures()
+                if self._furnace_reader and self.config.furnace.enabled and now >= self._runtime_state.next_furnace_poll_at:
+                    pv, sv = read_furnace_temperatures(self._furnace_reader)
                     polled_any = True
-                    self._next_furnace_poll_at = now + self._furnace_poll_interval()
-                    if pv is not None:
-                        self._last_furnace_pv = pv
-                        self._last_furnace_pv_timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
-                    if sv is not None:
-                        self._last_furnace_sv = sv
-                        self._last_furnace_sv_timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
+                    self._runtime_state.next_furnace_poll_at = now + furnace_poll_interval(self.config)
+                    self._runtime_state.record_furnace(pv, sv)
 
                 if polled_any:
-                    record = MeasurementRecord(
-                        timestamp=datetime.now().astimezone().isoformat(timespec="milliseconds"),
-                        mass=self._last_mass,
-                        furnace_pv=self._last_furnace_pv,
-                        furnace_sv=self._last_furnace_sv,
-                        mass_timestamp=self._last_mass_timestamp,
-                        furnace_pv_timestamp=self._last_furnace_pv_timestamp,
-                        furnace_sv_timestamp=self._last_furnace_sv_timestamp,
-                    )
-                    self._sample_count += 1
+                    record = self._runtime_state.build_record()
                     self._csv_logger.append(record)
                     self._events.put(self._build_snapshot(record))
             except Exception:
                 self.logger.exception("Unexpected error inside the acquisition loop.")
 
-            remaining = self._next_wait_seconds(cycle_started)
+            remaining = next_wait_seconds(self.config, self._runtime_state, cycle_started)
             if remaining > 0:
                 self._stop_event.wait(remaining)
 
-    def _build_snapshot(self, record: MeasurementRecord) -> AcquisitionSnapshot:
-        return AcquisitionSnapshot(
-            record=record,
+    def _build_snapshot(self, record) -> AcquisitionSnapshot:
+        return build_acquisition_snapshot(
+            self.config,
+            self._runtime_state,
+            record,
             scale_connected=self._scale_reader.connected if self._scale_reader else False,
             furnace_connected=self._furnace_reader.connected if self._furnace_reader else False,
-            scale_port=self.config.scale.port,
-            furnace_port=self.config.furnace.port,
-            test_mode=self.config.app.test_mode,
-            sample_count=self._sample_count,
         )
 
     def _close_readers(self) -> None:
@@ -196,48 +164,3 @@ class AcquisitionController:
             self._furnace_reader.close()
             self._furnace_reader = None
 
-    def _create_furnace_reader(self) -> FurnaceReader | DK518Reader | PassiveFurnaceReader:
-        driver = (self.config.furnace.driver or "modbus").lower()
-        if driver == "dk518":
-            return PassiveFurnaceReader(
-                self.config.furnace,
-                test_mode=self._furnace_test_mode_enabled(),
-                logger=self.logger.getChild("furnace"),
-            )
-        return FurnaceReader(
-            self.config.furnace,
-            test_mode=self._furnace_test_mode_enabled(),
-            logger=self.logger.getChild("furnace"),
-        )
-
-    def _scale_test_mode_enabled(self) -> bool:
-        if not self.config.app.test_mode:
-            return False
-        return self.config.app.test_mode_scope in {"all", "scale"}
-
-    def _furnace_test_mode_enabled(self) -> bool:
-        if not self.config.app.test_mode:
-            return False
-        return self.config.app.test_mode_scope in {"all", "furnace"}
-
-    def _scale_poll_interval(self) -> float:
-        if self.config.scale.p1_polling_enabled:
-            return max(0.1, float(self.config.scale.p1_poll_interval_sec))
-        return max(0.1, float(self.config.app.poll_interval_sec))
-
-    def _furnace_poll_interval(self) -> float:
-        return max(0.1, float(self.config.app.poll_interval_sec))
-
-    def _next_wait_seconds(self, cycle_started: float) -> float:
-        targets = [target for target in (self._next_scale_poll_at, self._next_furnace_poll_at) if target > 0]
-        if not targets:
-            return max(0.05, self.config.app.poll_interval_sec - (time.monotonic() - cycle_started))
-        return max(0.05, min(targets) - time.monotonic())
-
-    def _read_furnace_temperatures(self) -> tuple[float | None, float | None]:
-        if self._furnace_reader is None:
-            return None, None
-        read_pair = getattr(self._furnace_reader, "read_temperatures", None)
-        if callable(read_pair):
-            return read_pair()
-        return self._furnace_reader.read_pv(), self._furnace_reader.read_sv()

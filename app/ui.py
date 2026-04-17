@@ -5,11 +5,12 @@ import dataclasses
 import json
 import logging
 import queue
+import threading
 import subprocess
 import time
 import tkinter as tk
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -18,457 +19,47 @@ import pandas as pd
 
 from app.config import load_config, resolve_path, save_config
 from app.logger_setup import reconfigure_file_logging
-from app.models import AcquisitionSnapshot, AppConfig, PortInfo
+from app.models import AcquisitionSnapshot, AppConfig, MeasurementRecord, PortInfo
+from app.settings.schema import (
+    DEFAULTS,
+    SETTINGS_SECTIONS,
+    TABLE_COLUMN_SPECS,
+    TEST_MODE_SCOPE_LABELS,
+    TEST_MODE_SCOPE_VALUES,
+    TOOLTIP_DETAILS,
+)
 from app.services.acquisition import AcquisitionController
 from app.services.device_probe import probe_furnace_port, probe_scale_port
+from app.services.excel_support import read_excel_frame
 from app.services.export_service import MeasurementExportService
+from app.services.noise_filter import NoiseReductionConfig
 from app.services.plotter import LivePlotter
+from app.services.plot_series_helpers import coerce_timestamp
 from app.theme import ThemeManager, ThemePalette
+from app.ui_support.dialogs.help_dialogs import (
+    show_about_dialog as open_about_dialog,
+    show_help_dialog as open_help_dialog,
+    show_tools_dialog as open_tools_dialog,
+)
+from app.ui_support.panels.left_panel import build_left_panel as build_left_panel_view
+from app.ui_support.panels.right_panel import build_right_panel as build_right_panel_view
+from app.ui_support.session_manager import (
+    autosave_session as autosave_session_data,
+    autosave_timer as autosave_session_timer,
+    build_session_data as build_session_payload,
+    build_table_export_frame as build_table_export_df,
+    cleanup_autosaves as cleanup_autosave_files,
+    load_session as load_session_data,
+    save_session as save_session_data,
+    update_restore_session_menu as update_restore_session_menu_data,
+)
+from app.ui_support.widgets import MetricCard, ToolTip
 from app.utils.serial_tools import (
     detect_preferred_ports,
     guess_port_kind,
     list_available_ports,
     port_display_label,
 )
-
-
-DEFAULTS: dict[str, object] = {
-    "scale.enabled": True,
-    "scale.baudrate": 9600,
-    "scale.timeout": 1.0,
-    "scale.mode": "continuous",
-    "scale.request_command": "P\r\n",
-    "scale.p1_polling_enabled": False,
-    "scale.p1_poll_interval_sec": 0.1,
-    "furnace.enabled": True,
-    "furnace.baudrate": 9600,
-    "furnace.bytesize": 7,
-    "furnace.parity": "E",
-    "furnace.stopbits": 1,
-    "furnace.timeout": 1.0,
-    "furnace.slave_id": 1,
-    "furnace.register_pv": 90,
-    "furnace.register_sv": 91,
-    "furnace.scale_factor": 0.1,
-    "furnace.driver": "dk518",
-    "furnace.access_mode": "read_only",
-    "furnace.window_enabled": False,
-    "furnace.window_period_ms": 1000,
-    "furnace.window_open_ms": 120,
-    "furnace.window_offset_ms": 0,
-    "furnace.experimental_write_enabled": False,
-    "furnace.input_type_code": 0,
-    "furnace.input_type_name": "K",
-    "furnace.high_limit": 1200.0,
-    "furnace.high_alarm": 999.9,
-    "furnace.low_alarm": 999.9,
-    "furnace.pid_p": 10.0,
-    "furnace.pid_t": 8.0,
-    "furnace.ctrl_mode": 3,
-    "furnace.output_high_limit": 100.0,
-    "furnace.display_decimals": 2,
-    "furnace.sensor_correction": 0.0,
-    "furnace.opt_code": 8,
-    "furnace.run_code": 27,
-    "furnace.alarm_output_code": 3333,
-    "furnace.m5_value": 420.0,
-    "app.poll_interval_sec": 1.0,
-    "app.max_points_on_plot": 500,
-    "app.auto_detect_ports": True,
-    "app.test_mode": False,
-    "app.test_mode_scope": "all",
-    "app.autosave_settings": False,
-    "app.enable_file_logging": False,
-    "app.start_maximized": False,
-    "app.fullscreen": False,
-    "app.font_scale": 1.05,
-    "app.theme": "dark",
-    "app.csv_path": "data/measurements.csv",
-    "app.log_path": "logs/app.log",
-}
-
-
-SETTINGS_SECTIONS: list[
-    tuple[str, list[tuple[str, str, str, str, tuple[str, ...] | None]]]
-] = [
-    (
-        "Весы",
-        [
-            (
-                "scale.enabled",
-                "Использовать весы",
-                "bool",
-                "Включает опрос лабораторных весов.",
-                None,
-            ),
-            (
-                "scale.baudrate",
-                "Скорость связи",
-                "entry",
-                "Для ускоренного режима обычно 9600 бод, если весы настроены так же.",
-                None,
-            ),
-            (
-                "scale.timeout",
-                "Таймаут, сек",
-                "entry",
-                "Сколько ждать строку от весов перед повтором.",
-                None,
-            ),
-            (
-                "scale.mode",
-                "Режим чтения",
-                "combo",
-                "Для P2 Con лучше continuous. auto оставляет резервный опрос, если поток пропадёт.",
-                ("auto", "continuous", "poll"),
-            ),
-            (
-                "scale.request_command",
-                "Команда опроса",
-                "entry",
-                "Обычно P\\r\\n. Тара и ноль задаются отдельными кнопками.",
-                None,
-            ),
-            (
-                "scale.p1_polling_enabled",
-                "Режим P1 Prt",
-                "bool",
-                "Принудительно читать весы по команде P в режиме P1 Prt.",
-                None,
-            ),
-            (
-                "scale.p1_poll_interval_sec",
-                "Тайминг опроса P1, сек",
-                "entry",
-                "Интервал между командными опросами в P1 Prt. По умолчанию быстрый.",
-                None,
-            ),
-        ],
-    ),
-    (
-        "Печь",
-        [
-            (
-                "furnace.enabled",
-                "Использовать печь",
-                "bool",
-                "Включает чтение температуры по Modbus RTU.",
-                None,
-            ),
-            (
-                "furnace.driver",
-                "Драйвер печи",
-                "combo",
-                "Выберите профиль dk518 или ручной Modbus-режим для другого контроллера.",
-                ("dk518", "modbus"),
-            ),
-            (
-                "furnace.baudrate",
-                "Скорость связи",
-                "entry",
-                "Обычно 9600 бод для USB-RS485 адаптера.",
-                None,
-            ),
-            (
-                "furnace.bytesize",
-                "Биты данных",
-                "combo",
-                "Для подтверждённого профиля DK518 используется 7 бит данных.",
-                ("7", "8"),
-            ),
-            (
-                "furnace.parity",
-                "Чётность",
-                "combo",
-                "Для подтверждённого профиля DK518 используется E.",
-                ("N", "E", "O"),
-            ),
-            ("furnace.stopbits", "Стоп-биты", "combo", "Обычно 1.", ("1", "1.5", "2")),
-            (
-                "furnace.timeout",
-                "Таймаут, сек",
-                "entry",
-                "Сколько ждать ответ по Modbus RTU.",
-                None,
-            ),
-            (
-                "furnace.slave_id",
-                "Адрес устройства",
-                "entry",
-                "Modbus slave ID контроллера.",
-                None,
-            ),
-            (
-                "furnace.register_pv",
-                "Регистр температуры камеры",
-                "entry",
-                "Подтверждённый адрес для температуры внутри камеры: 90 / 0x005A.",
-                None,
-            ),
-            (
-                "furnace.register_sv",
-                "Регистр температуры термопары",
-                "entry",
-                "Подтверждённый адрес для термопары: 91 / 0x005B.",
-                None,
-            ),
-            (
-                "furnace.scale_factor",
-                "Масштаб температуры",
-                "entry",
-                "Например 0.1, если 253 означает 25.3 °C.",
-                None,
-            ),
-            (
-                "furnace.input_type_code",
-                "Код входа датчика",
-                "entry",
-                "С панели MCGS сейчас считан код 0.",
-                None,
-            ),
-            (
-                "furnace.input_type_name",
-                "Тип датчика",
-                "combo",
-                "С панели MCGS сейчас считан тип K.",
-                (
-                    "K",
-                    "S",
-                    "R",
-                    "T",
-                    "E",
-                    "J",
-                    "B",
-                    "N",
-                    "WRe3-25",
-                    "WRe5-26",
-                    "Cu50",
-                    "Pt100",
-                ),
-            ),
-            (
-                "furnace.high_limit",
-                "Верхний предел",
-                "entry",
-                "С панели MCGS: HIAL = 1200.",
-                None,
-            ),
-            (
-                "furnace.high_alarm",
-                "Верхняя тревога",
-                "entry",
-                "С панели MCGS: DHAL = 999.9.",
-                None,
-            ),
-            (
-                "furnace.low_alarm",
-                "Нижняя тревога",
-                "entry",
-                "С панели MCGS: DLAL = 999.9.",
-                None,
-            ),
-            ("furnace.pid_p", "PID: P", "entry", "С панели MCGS: P = 10.", None),
-            ("furnace.pid_t", "PID: T", "entry", "С панели MCGS: T = 8.", None),
-            (
-                "furnace.ctrl_mode",
-                "Режим CTRL",
-                "entry",
-                "С панели MCGS: CTRL = 3.",
-                None,
-            ),
-            (
-                "furnace.output_high_limit",
-                "Предел выхода OPH",
-                "entry",
-                "С панели MCGS: OPH = 100.",
-                None,
-            ),
-            (
-                "furnace.display_decimals",
-                "Разрядность DL",
-                "entry",
-                "С панели MCGS: DL = 2.",
-                None,
-            ),
-            (
-                "furnace.sensor_correction",
-                "Коррекция SC",
-                "entry",
-                "С панели MCGS: SC = 0.",
-                None,
-            ),
-            ("furnace.opt_code", "Код OPT", "entry", "С панели MCGS: OPT = 8.", None),
-            ("furnace.run_code", "Код RUN", "entry", "С панели MCGS: RUN = 27.", None),
-            (
-                "furnace.alarm_output_code",
-                "Код ALOP",
-                "entry",
-                "С панели MCGS: ALOP = 3333.",
-                None,
-            ),
-            (
-                "furnace.m5_value",
-                "Параметр M5",
-                "entry",
-                "С панели MCGS: M5 = 420.",
-                None,
-            ),
-        ],
-    ),
-    (
-        "Приложение",
-        [
-            (
-                "app.poll_interval_sec",
-                "Интервал опроса, сек",
-                "entry",
-                "Как часто обновлять измерения и график.",
-                None,
-            ),
-            (
-                "app.max_points_on_plot",
-                "Точек на графике",
-                "entry",
-                "Сколько последних точек держать на экране.",
-                None,
-            ),
-            (
-                "app.auto_detect_ports",
-                "Автопоиск COM-портов",
-                "bool",
-                "При запуске программа пытается найти и назначить печь и весы по именам COM-устройств.",
-                None,
-            ),
-            (
-                "app.test_mode",
-                "Тестовый режим",
-                "bool",
-                "Генерирует данные без реального оборудования.",
-                None,
-            ),
-            (
-                "app.test_mode_scope",
-                "Что эмулировать",
-                "combo",
-                "Можно эмулировать только весы, только печь или оба устройства сразу.",
-                ("all", "scale", "furnace"),
-            ),
-        ],
-    ),
-    (
-        "Интерфейс и файлы",
-        [
-            (
-                "app.theme",
-                "Тема оформления",
-                "combo",
-                "Оформление окна программы.",
-                ("dark", "light"),
-            ),
-            (
-                "app.start_maximized",
-                "Старт развернутым",
-                "bool",
-                "Рекомендуется включить для лабораторного ПК.",
-                None,
-            ),
-            (
-                "app.fullscreen",
-                "Полный экран",
-                "bool",
-                "Если включено, окно откроется на весь экран.",
-                None,
-            ),
-            (
-                "app.csv_path",
-                "Файл CSV",
-                "entry",
-                "Основной файл накопления измерений.",
-                None,
-            ),
-            (
-                "app.log_path",
-                "Файл журнала",
-                "entry",
-                "Файл служебного журнала программы.",
-                None,
-            ),
-            (
-                "app.enable_file_logging",
-                "Включить автологирование",
-                "bool",
-                "Записывать служебный журнал в файл на диске.",
-                None,
-            ),
-        ],
-    ),
-]
-
-
-TOOLTIP_DETAILS: dict[str, str] = {
-    "scale.enabled": "Отключите этот параметр, если весы физически не подключены, чтобы программа не тратила время на лишние попытки чтения.",
-    "scale.baudrate": "Если на весах уже включены P2 Con и For2, удобно использовать 9600 бод. Главное, чтобы скорость в программе совпадала с настройкой самих весов.",
-    "scale.timeout": "Слишком маленький таймаут даст ложные ошибки, слишком большой замедлит опрос. Для начала обычно хватает 0.8-1.5 секунды.",
-    "scale.mode": "Режим auto обычно самый удобный: программа сначала ждёт поток, а если поток не идёт, отправляет команду опроса сама.",
-    "scale.request_command": "Меняйте это поле только если на реальном стенде выяснится, что весы требуют другую ASCII-команду. Обычно достаточно P\\r\\n.",
-    "scale.p1_polling_enabled": "Включайте только если на самих весах выставлен режим P1 Prt. Тогда программа будет опрашивать их по команде, а не ждать непрерывный поток.",
-    "scale.p1_poll_interval_sec": "Если хотите максимально частый опрос в P1 Prt, ставьте маленький интервал вроде 0.1-0.2 секунды. Слишком маленькое значение может только зря грузить COM-порт.",
-    "furnace.enabled": "Если печь пока не подключена, можно временно снять галочку. Тогда программа продолжит работать только с весами.",
-    "furnace.driver": "dk518 — готовый профиль для вашей печи: 9600 7E1, slave 1, чтение только. modbus — ручной профиль для другого контроллера и своих регистров.",
-    "furnace.baudrate": "Если есть связь по USB-RS485, но нет ответа Modbus, проверьте baudrate одним из первых параметров вместе с parity и slave ID.",
-    "furnace.bytesize": "У большинства контроллеров используется 8 бит данных. Меняйте только если это явно указано в документации контроллера.",
-    "furnace.parity": "Для Modbus RTU часто критично совпадение parity. Если N не работает, проверьте в документации варианты E или O.",
-    "furnace.stopbits": "Обычно используется 1 стоп-бит. Несовпадение этого параметра тоже может полностью ломать обмен по Modbus.",
-    "furnace.timeout": "Если контроллер отвечает медленно, попробуйте увеличить таймаут до 1.5-2.0 секунды, чтобы исключить ложные таймауты.",
-    "furnace.slave_id": "Это адрес Modbus-устройства. Если контроллер на шине не один, у каждого устройства должен быть свой адрес.",
-    "furnace.register_pv": "Для текущего профиля DK518 здесь подтверждён адрес 90 (0x005A): температура внутри камеры.",
-    "furnace.register_sv": "Для текущего профиля DK518 здесь подтверждён адрес 91 (0x005B): температура термопары.",
-    "furnace.scale_factor": "Если регистр возвращает, например, 253 вместо 25.3 °C, задайте коэффициент 0.1. Если приходит 2530, может понадобиться 0.01.",
-    "furnace.input_type_code": "На панели MCGS видно INP = 0, а по таблице типов это K. Это справочный параметр: для Modbus-обмена он сам по себе не задаёт адреса регистров.",
-    "furnace.input_type_name": "Сейчас с панели видно, что датчик настроен как термопара K. Если на реальном контроллере тип сменят, обновите это поле для наглядности в проекте.",
-    "furnace.high_limit": "Сейчас на панели видно HIAL = 1200. Полезно как ориентир верхнего диапазона, но на чтение Modbus напрямую не влияет.",
-    "furnace.high_alarm": "Сейчас на панели видно DHAL = 999.9. Это справочный порог аварии.",
-    "furnace.low_alarm": "Сейчас на панели видно DLAL = 999.9. Это справочный порог аварии.",
-    "furnace.pid_p": "Сейчас на панели видно P = 10. Поле справочное, чтобы держать под рукой текущую настройку контура.",
-    "furnace.pid_t": "Сейчас на панели видно T = 8. Поле справочное, без записи в контроллер.",
-    "furnace.ctrl_mode": "Сейчас на панели видно CTRL = 3. Пока трактуем как паспортную настройку контроллера.",
-    "furnace.output_high_limit": "Сейчас на панели видно OPH = 100. Это верхний предел выхода контроллера.",
-    "furnace.display_decimals": "Сейчас на панели видно DL = 2. Может помочь при подборе scale_factor и понимании формата отображения.",
-    "furnace.sensor_correction": "Сейчас на панели видно SC = 0. Это коррекция датчика/смещение.",
-    "furnace.opt_code": "Сейчас на панели видно OPT = 8. Поле оставлено как справочный код конфигурации.",
-    "furnace.run_code": "Сейчас на панели видно RUN = 27. Поле оставлено как справочный код конфигурации.",
-    "furnace.alarm_output_code": "Сейчас на панели видно ALOP = 3333. Поле оставлено как справочный код конфигурации.",
-    "furnace.m5_value": "Сейчас на панели видно M5 = 420. Пока используем как паспортное значение, без попыток трактовать жёстко.",
-    "app.auto_detect_ports": "Если галочка включена, программа при старте обновляет список COM-портов и пытается сама назначить печь и весы по описанию USB-адаптеров.",
-    "app.poll_interval_sec": "Для большинства задач 1 секунда удобно и достаточно. Уменьшайте интервал только если действительно нужна более частая запись.",
-    "app.max_points_on_plot": "Чем больше точек, тем длиннее история на экране, но тем тяжелее перерисовка графика на слабом ноутбуке.",
-    "app.test_mode": "Полезно для проверки интерфейса дома без оборудования: программа будет сама генерировать массу и температуру.",
-    "app.autosave_settings": "Когда автосохранение включено, корректные изменения применяются и записываются в config.yaml сразу. Если поле введено не полностью, сохранение подождёт валидного значения.",
-    "app.enable_file_logging": "Когда эта галочка выключена, программа пишет сообщения только в окно журнала и в консоль. Файл на диске не создаётся.",
-    "app.theme": "Переключайте тему под освещение лаборатории. Светлая удобнее для печати скриншотов, тёмная часто комфортнее при длительной работе.",
-    "app.start_maximized": "Рекомендуется оставить включённым для лабораторного ПК, чтобы все крупные элементы были сразу хорошо видны.",
-    "app.fullscreen": "Используйте только если хотите режим без рамок окна. Для обычной работы чаще удобнее просто развёрнутое окно.",
-    "app.test_mode_scope": "Можно включить эмуляцию только весов, только печи или сразу обоих устройств. Это удобно для проверки интерфейса и логики без полного стенда.",
-    "app.csv_path": "Это основной файл накопления измерений. Убедитесь, что папка доступна на запись и не находится в защищённом системном каталоге.",
-    "app.log_path": "Если программа ведёт себя нестабильно, этот файл помогает понять причину. Логи удобно прикладывать при разборе ошибок.",
-    "app.font_scale": "Масштаб шрифта интерфейса. Увеличивайте, если на экране много мелкого текста. После резкого увеличения шрифта лучше перезапустить программу.",
-}
-
-
-TABLE_COLUMN_SPECS: tuple[tuple[str, str, int, str], ...] = (
-    ("timestamp", "Время", 270, "w"),
-    ("mass", "Масса, г", 130, "center"),
-    ("pv", "Камера PV, °C", 150, "center"),
-    ("sv", "Термопара SV, °C", 170, "center"),
-)
-
-TEST_MODE_SCOPE_LABELS: dict[str, str] = {
-    "all": "Весы и печь",
-    "scale": "Только весы",
-    "furnace": "Только печь",
-}
-TEST_MODE_SCOPE_VALUES: tuple[str, ...] = tuple(TEST_MODE_SCOPE_LABELS.values())
-
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
@@ -518,130 +109,6 @@ class UILogHandler(logging.Handler):
             self.handleError(record)
 
 
-class ToolTip:
-    def __init__(self, widget, text: str) -> None:
-        self.widget = widget
-        self.text = text
-        self.tip_window: tk.Toplevel | None = None
-        widget.bind("<Enter>", self._show)
-        widget.bind("<Leave>", self._hide)
-
-    def _show(self, _event=None) -> None:
-        if self.tip_window or not self.text:
-            return
-        x = self.widget.winfo_rootx() + 18
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
-        self.tip_window = tk.Toplevel(self.widget)
-        self.tip_window.wm_overrideredirect(True)
-        self.tip_window.wm_geometry(f"+{x}+{y}")
-        label = tk.Label(
-            self.tip_window,
-            text=self.text,
-            justify="left",
-            wraplength=360,
-            bg="#FFFBEA",
-            fg="#1F2937",
-            relief="solid",
-            bd=1,
-            padx=12,
-            pady=8,
-            font=("Segoe UI", 10),
-        )
-        label.pack()
-
-    def _hide(self, _event=None) -> None:
-        if self.tip_window is not None:
-            self.tip_window.destroy()
-            self.tip_window = None
-
-
-class MetricCard(tk.Frame):
-    def __init__(
-        self,
-        master,
-        title: str,
-        accent_role: str,
-        *,
-        value_size: int,
-        unit_size: int = 22,
-    ) -> None:
-        super().__init__(master, bd=0)
-        self.title_text = title
-        self.accent_role = accent_role
-        self.value_size = value_size
-        self.unit_size = unit_size
-        self.default_border = "#243140"
-
-        self.top_bar = tk.Frame(self, height=4, bd=0)
-        self.top_bar.pack(fill="x", side="top")
-
-        self.body = tk.Frame(self, bd=0)
-        self.body.pack(fill="both", expand=True)
-
-        self.title_label = tk.Label(self.body, anchor="w")
-        self.title_label.pack(fill="x")
-
-        self.value_row = tk.Frame(self.body, bd=0)
-        self.value_row.pack(fill="x", pady=(6, 3))
-        self.value_row.grid_columnconfigure(0, weight=1)
-        self.value_label = tk.Label(self.value_row, text="--", anchor="w")
-        self.value_label.grid(row=0, column=0, sticky="ew")
-        self.unit_label = tk.Label(self.value_row, text="", anchor="sw")
-        self.unit_label.grid(row=0, column=1, sticky="sw", padx=(6, 0), pady=(0, 2))
-
-        self.subtitle_label = tk.Label(self.body, anchor="w", justify="left")
-        self.subtitle_label.pack(fill="x")
-
-    def apply_theme(self, palette: ThemePalette, scale: float) -> None:
-        accent = getattr(palette, self.accent_role, palette.accent)
-        self.default_border = palette.border
-        self.configure(
-            bg=palette.card_bg, highlightthickness=1, highlightbackground=palette.border
-        )
-        self.top_bar.configure(bg=accent)
-        self.body.configure(
-            bg=palette.card_bg,
-            padx=max(12, int(14 * scale)),
-            pady=max(10, int(12 * scale)),
-        )
-        self.value_row.configure(bg=palette.card_bg)
-        self.title_label.configure(
-            bg=palette.card_bg,
-            fg=palette.subtext,
-            text=self.title_text,
-            font=("Segoe UI Semibold", max(12, int(13 * scale))),
-        )
-        value_font_size = max(
-            20, min(int(self.value_size * scale), self.value_size + 2)
-        )
-        unit_font_size = max(9, min(int(self.unit_size * scale), self.unit_size + 1))
-        subtitle_font_size = max(10, min(int(12 * scale), 12))
-        self.value_label.configure(
-            bg=palette.card_bg,
-            fg=palette.text,
-            font=("Bahnschrift SemiBold", value_font_size),
-        )
-        self.unit_label.configure(
-            bg=palette.card_bg,
-            fg=palette.subtext,
-            font=("Segoe UI Semibold", unit_font_size),
-        )
-        self.subtitle_label.configure(
-            bg=palette.card_bg,
-            fg=palette.subtext,
-            font=("Segoe UI", subtitle_font_size),
-        )
-
-    def set_value(self, value: str, *, unit: str = "", subtitle: str = "") -> None:
-        self.value_label.configure(text=value)
-        self.unit_label.configure(text=unit)
-        self.subtitle_label.configure(text=subtitle)
-
-    def pulse(self, color: str) -> None:
-        self.configure(highlightbackground=color)
-        self.after(260, lambda: self.configure(highlightbackground=self.default_border))
-
-
 class LabForgeApp(tk.Tk):
     def __init__(
         self, config: AppConfig, config_path: Path, logger: logging.Logger
@@ -652,6 +119,7 @@ class LabForgeApp(tk.Tk):
         self.config_data = config
         self.config_path = config_path
         self.logger = logger
+        self.TABLE_COLUMN_SPECS = TABLE_COLUMN_SPECS
         self.controller = AcquisitionController(
             config, logger=logger.getChild("acquisition")
         )
@@ -682,9 +150,18 @@ class LabForgeApp(tk.Tk):
         self._table_timestamp_map: dict[str, str] = {}
         self.plot_side_panels: dict[str, dict[str, object]] = {}
         self.measurement_records: list[MeasurementRecord] = []
+        self._session_started_at: datetime | None = None
+        self._baseline_mass: float | None = None
+        self._baseline_mass_timestamp: str | None = None
+        self._baseline_mass_samples: list[float] = []
+        self._baseline_capture_seconds = 3.0
         self.session_autosave_dir = resolve_path("sessions/autosave")
         self.session_autosave_dir.mkdir(parents=True, exist_ok=True)
         self._autosave_timer_id = None
+        self._autosave_session_key = ""
+        self._autosave_session_day = ""
+        self._autosave_session_path: Path | None = None
+        self._summary_export_text = ""
 
         self._apply_tk_scaling()
         self.title("DataFusion RT")
@@ -722,6 +199,10 @@ class LabForgeApp(tk.Tk):
         self.settings_mode_hint_var = tk.StringVar(
             value="Изменения записываются только после нажатия кнопки «Сохранить»."
         )
+        self._scale_command_in_progress = False
+        self._acquisition_paused = False
+        self._settings_lock_notified = False
+        self._settings_input_widgets: list[object] = []
         self._suspend_settings_autosave = False
         self._plot_panel_canvases: list[tk.Canvas] = []
         self._plot_panel_bodies: list[ttk.Frame] = []
@@ -963,8 +444,10 @@ class LabForgeApp(tk.Tk):
             "*TCombobox*Listbox.Font",
             f"{{Segoe UI}} {max(11, int(12 * self.ui_scale))}",
         )
-        self.file_menu_button = self._make_menu_button(parent, "Сохранить/экспорт")
+        self.file_menu_button = self._make_menu_button(parent, "Экспорт / импорт")
         file_menu = tk.Menu(self.file_menu_button, tearoff=False)
+        file_menu.add_command(label="Загрузить сессию", command=self.import_data_from_file)
+        file_menu.add_separator()
         file_menu.add_command(
             label="Экспорт CSV",
             command=lambda: self.export_measurements(default_ext=".csv"),
@@ -1054,82 +537,7 @@ class LabForgeApp(tk.Tk):
         }
 
     def _build_left_panel(self) -> None:
-        ttk.Label(
-            self.left_panel, text="Подключение устройств", style="CardTitle.TLabel"
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Label(
-            self.left_panel, textvariable=self.port_status_var, style="CardText.TLabel"
-        ).grid(row=1, column=0, sticky="w", pady=(self._pad_y(4), self._pad_y(10)))
-
-        tree_frame = ttk.Frame(self.left_panel, style="Card.TFrame")
-        tree_frame.grid(row=2, column=0, sticky="nsew")
-        tree_frame.grid_rowconfigure(0, weight=1)
-        tree_frame.grid_columnconfigure(0, weight=1)
-
-        self.port_tree = ttk.Treeview(
-            tree_frame, columns=("port", "kind", "desc"), show="headings", height=10
-        )
-        self.port_tree.heading("port", text="Порт")
-        self.port_tree.heading("kind", text="Тип")
-        self.port_tree.heading("desc", text="Устройство")
-        self.port_tree.column("port", width=int(90 * self.ui_scale), anchor="w")
-        self.port_tree.column("kind", width=int(150 * self.ui_scale), anchor="w")
-        self.port_tree.column("desc", width=int(250 * self.ui_scale), anchor="w")
-        self.port_tree.grid(row=0, column=0, sticky="nsew")
-        self.port_tree.bind("<<TreeviewSelect>>", self._on_port_selected)
-
-        scrollbar = ttk.Scrollbar(
-            tree_frame, orient="vertical", command=self.port_tree.yview
-        )
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self.port_tree.configure(yscrollcommand=scrollbar.set)
-
-        self.assignment_label = ttk.Label(
-            self.left_panel,
-            textvariable=self.assignment_var,
-            style="CardText.TLabel",
-            wraplength=int(420 * self.ui_scale),
-        )
-        self.assignment_label.grid(
-            row=3, column=0, sticky="w", pady=(self._pad_y(10), 0)
-        )
-
-        ports_bar = ttk.Frame(self.left_panel, style="Card.TFrame")
-        ports_bar.grid(row=4, column=0, sticky="ew", pady=(self._pad_y(12), 0))
-        for idx in range(2):
-            ports_bar.grid_columnconfigure(idx, weight=1)
-        ttk.Button(
-            ports_bar,
-            text="Назначить как Весы",
-            style="Soft.TButton",
-            command=self.assign_selected_to_scale,
-        ).grid(row=0, column=0, sticky="ew", padx=(0, self._pad_x(6)))
-        ttk.Button(
-            ports_bar,
-            text="Назначить как Печь",
-            style="Soft.TButton",
-            command=self.assign_selected_to_furnace,
-        ).grid(row=0, column=1, sticky="ew", padx=(self._pad_x(6), 0))
-
-        probe_bar = ttk.Frame(self.left_panel, style="Card.TFrame")
-        probe_bar.grid(row=5, column=0, sticky="ew", pady=(self._pad_y(10), 0))
-        for idx in range(3):
-            probe_bar.grid_columnconfigure(idx, weight=1)
-        ttk.Button(
-            probe_bar, text="Найти", style="Soft.TButton", command=self.refresh_ports
-        ).grid(row=0, column=0, sticky="ew", padx=(0, self._pad_x(6)))
-        ttk.Button(
-            probe_bar,
-            text="Проверить весы",
-            style="Soft.TButton",
-            command=self.probe_scale_device,
-        ).grid(row=0, column=1, sticky="ew", padx=self._pad_pair(3))
-        ttk.Button(
-            probe_bar,
-            text="Проверить печь",
-            style="Soft.TButton",
-            command=self.probe_furnace_device,
-        ).grid(row=0, column=2, sticky="ew", padx=(self._pad_x(6), 0))
+        build_left_panel_view(self)
 
     def _build_center_panel(self) -> None:
         content_tabs = ttk.Notebook(self.center_panel, style="Compact.TNotebook")
@@ -1138,12 +546,17 @@ class LabForgeApp(tk.Tk):
 
         graph_tab = ttk.Frame(content_tabs, style="App.TFrame")
         table_tab = ttk.Frame(content_tabs, style="App.TFrame")
+        summary_tab = ttk.Frame(content_tabs, style="App.TFrame")
         graph_tab.grid_rowconfigure(0, weight=1)
         graph_tab.grid_columnconfigure(0, weight=1)
         table_tab.grid_rowconfigure(0, weight=1)
         table_tab.grid_columnconfigure(0, weight=1)
+        summary_tab.grid_rowconfigure(0, weight=1)
+        summary_tab.grid_columnconfigure(0, weight=1)
         content_tabs.add(graph_tab, text="График")
         content_tabs.add(table_tab, text="Таблица")
+        content_tabs.add(summary_tab, text="Отчёт")
+        self.summary_tab = summary_tab
 
         plot_card = ttk.Frame(graph_tab, style="Card.TFrame", padding=self._pad(8, 8))
         plot_card.grid(row=0, column=0, sticky="nsew")
@@ -1180,10 +593,9 @@ class LabForgeApp(tk.Tk):
         self.plotter.get_widget().grid(
             row=1, column=0, sticky="nsew", pady=(self._pad_y(4), 0)
         )
-        self.legend_panel = ttk.LabelFrame(
+        self.legend_panel = ttk.Frame(
             plot_card,
-            text="Легенда",
-            style="Section.TLabelframe",
+            style="CardAlt.TFrame",
             padding=self._pad(8, 5),
         )
         self.legend_panel.grid(row=2, column=0, sticky="ew", pady=(self._pad_y(5), 0))
@@ -1205,6 +617,7 @@ class LabForgeApp(tk.Tk):
             tools_body, "↔ Сдвиг", self.toggle_plot_pan, width=10
         )
         self.plot_pan_button.pack(fill="x", pady=(0, self._pad_y(5)))
+        ToolTip(self.plot_pan_button, "Режим ручного сдвига графика мышью.")
         self.calc_cursor_button = self._make_plot_tool_button(
             tools_body, "Курсор", self.toggle_calc_cursor, width=10
         )
@@ -1217,6 +630,7 @@ class LabForgeApp(tk.Tk):
             tools_body, "🔍", self.toggle_plot_zoom, width=10
         )
         self.plot_zoom_button.pack(fill="x", pady=(0, self._pad_y(5)))
+        ToolTip(self.plot_zoom_button, "Режим увеличения области графика мышью.")
         zoom_row = ttk.Frame(tools_body, style="Card.TFrame")
         zoom_row.pack(fill="x", pady=(0, self._pad_y(5)))
         zoom_row.columnconfigure(0, weight=1)
@@ -1227,37 +641,37 @@ class LabForgeApp(tk.Tk):
         self.plot_plus_button.grid(
             row=0, column=0, sticky="ew", padx=(0, self._pad_x(3))
         )
+        ToolTip(self.plot_plus_button, "Приблизить график по вертикали.")
         self.plot_minus_button = self._make_plot_tool_button(
             zoom_row, "-", self.zoom_out_plot, width=4
         )
         self.plot_minus_button.grid(
             row=0, column=1, sticky="ew", padx=(self._pad_x(3), 0)
         )
+        ToolTip(self.plot_minus_button, "Отдалить график по вертикали.")
         self.plot_reset_button = self._make_plot_tool_button(
-            tools_body, "Сброс", self.reset_plot_view, width=10
+            tools_body, "Авто / сброс", self.reset_plot_view, width=14
         )
         self.plot_reset_button.pack(fill="x", pady=(0, self._pad_y(5)))
-        self.plot_auto_button = self._make_plot_tool_button(
-            tools_body, "Авто", self.autoscale_plot, width=10
-        )
-        self.plot_auto_button.pack(fill="x", pady=(0, self._pad_y(5)))
+        ToolTip(self.plot_reset_button, "Сбросить ручной сдвиг и сразу вернуть автоматический масштаб графика.")
         self.plot_scale_button = self._make_plot_tool_button(
             tools_body, "Масштаб", self.open_plot_scale_dialog, width=10
         )
         self.plot_scale_button.pack(fill="x", pady=(0, self._pad_y(5)))
-        self.plot_points_button = self._make_plot_tool_button(
-            tools_body, "Точки", self.set_plot_points, width=10
+        ToolTip(self.plot_scale_button, "Открыть расширенные настройки масштаба.")
+        self.plot_cut_button = self._make_plot_tool_button(
+            tools_body, "Вырезать", self.open_cut_data_dialog, width=10
         )
-        self.plot_points_button.pack(fill="x", pady=(0, self._pad_y(5)))
-        self.plot_lines_button = self._make_plot_tool_button(
-            tools_body, "Линии", self.set_plot_lines, width=10
+        self.plot_cut_button.pack(fill="x", pady=(0, self._pad_y(5)))
+        ToolTip(
+            self.plot_cut_button,
+            "Удалить выбранный интервал данных по одной оси или сразу по всем осям.",
         )
-        self.plot_lines_button.pack(fill="x", pady=(0, self._pad_y(5)))
         views_panel, views_body = self._create_plot_button_panel(
             plot_card,
             title="Виды",
             column=3,
-            width=int(126 * self.ui_scale),
+            width=int(198 * self.ui_scale),
             padx=(self._pad_x(6), 0),
             panel_key="views",
         )
@@ -1273,6 +687,34 @@ class LabForgeApp(tk.Tk):
             button = self._make_plot_tool_button(views_body, label, command, width=10)
             button.pack(fill="x", pady=(0, self._pad_y(5)))
             self.plot_mode_buttons[mode_key] = button
+            ToolTip(button, f"Переключить вид графика: {label.lower()}.")
+        ttk.Separator(views_body, orient="horizontal").pack(
+            fill="x", pady=(self._pad_y(2), self._pad_y(6))
+        )
+        self.plot_range_toggle_button = self._make_plot_tool_button(
+            views_body, "Окно: текущее", self.toggle_plot_range_mode, width=10
+        )
+        self.plot_range_toggle_button.pack(fill="x", pady=(0, self._pad_y(5)))
+        ToolTip(
+            self.plot_range_toggle_button,
+            "Переключить окно времени: текущий участок или весь график от начала записи.",
+        )
+        self.plot_time_axis_button = self._make_plot_tool_button(
+            views_body, "Время: от начала", self.toggle_plot_time_axis_mode, width=12
+        )
+        self.plot_time_axis_button.pack(fill="x", pady=(0, self._pad_y(5)))
+        ToolTip(
+            self.plot_time_axis_button,
+            "Переключить подписи оси времени между временем от начала записи и реальными часами.",
+        )
+        self.plot_render_toggle_button = self._make_plot_tool_button(
+            views_body, "Кривая: линии", self.toggle_plot_render_mode, width=12
+        )
+        self.plot_render_toggle_button.pack(fill="x", pady=(0, self._pad_y(5)))
+        ToolTip(
+            self.plot_render_toggle_button,
+            "Переключить стиль кривой между линиями и точками.",
+        )
 
         calculations_panel, calculations_body = self._create_plot_button_panel(
             plot_card,
@@ -1287,35 +729,46 @@ class LabForgeApp(tk.Tk):
             calculations_body, "DTG", self.activate_calc_dtg, width=12
         )
         self.calc_dtg_button.pack(fill="x", pady=(0, self._pad_y(5)))
+        ToolTip(self.calc_dtg_button, "Показать DTG: скорость изменения массы.")
         self.calc_normalize_button = self._make_plot_tool_button(
             calculations_body, "Нормал.", self.toggle_calc_normalization, width=12
         )
         self.calc_normalize_button.pack(fill="x", pady=(0, self._pad_y(5)))
+        ToolTip(self.calc_normalize_button, "Включить или отключить нормализацию массы.", placement="left")
         self.calc_markers_button = self._make_plot_tool_button(
-            calculations_body, "Маркеры", self.toggle_calc_markers, width=12
+            calculations_body, "Маркеры", self.open_calc_markers_menu, width=12
         )
         self.calc_markers_button.pack(fill="x", pady=(0, self._pad_y(5)))
+        ToolTip(self.calc_markers_button, "Поставить и двигать маркеры A/B для расчётов.", placement="left")
         self.calc_heating_profile_button = self._make_plot_tool_button(
             calculations_body, "Профиль нагрева", self.toggle_calc_heating_profile, width=12
         )
         self.calc_heating_profile_button.pack(fill="x", pady=(0, self._pad_y(5)))
+        ToolTip(self.calc_heating_profile_button, "Показать эталонный профиль нагрева по данным камеры.", placement="left")
+        self.calc_noise_button = self._make_plot_tool_button(
+            calculations_body, "Шум", self.open_noise_reduction_menu, width=12
+        )
+        self.calc_noise_button.pack(fill="x", pady=(0, self._pad_y(5)))
+        ToolTip(self.calc_noise_button, "Открыть параметры шумоподавления для данных и графика.", placement="left")
         self.plot_smooth_button = self._make_plot_tool_button(
             calculations_body, "Сглаж.", self.set_plot_smooth, width=12
         )
         self.plot_smooth_button.pack(fill="x", pady=(0, self._pad_y(5)))
+        ToolTip(self.plot_smooth_button, "Включить или отключить сглаженное отображение кривой.", placement="left")
         self.calc_stage_button = self._make_plot_tool_button(
             calculations_body, "Стадии", self.toggle_calc_stage_analysis, width=12
         )
         self.calc_stage_button.pack(fill="x", pady=(0, self._pad_y(5)))
-        self.calc_summary_button = self._make_plot_tool_button(
-            calculations_body, "Сводка", self.show_calc_summary, width=12
-        )
-        self.calc_summary_button.pack(fill="x")
+        ToolTip(self.calc_stage_button, "Подсветить найденный диапазон стадий процесса.", placement="left")
         self._update_plot_mode_buttons()
+        self._update_plot_range_buttons()
         self._update_plot_render_buttons()
+        self._update_plot_time_axis_button()
         self._update_calc_buttons()
         self._refresh_plot_legend()
         self._update_plot_side_panels_state()
+
+        self._build_summary_tab(summary_tab)
 
         table_card = ttk.Frame(
             table_tab, style="Card.TFrame", padding=self._pad(12, 12)
@@ -1332,6 +785,8 @@ class LabForgeApp(tk.Tk):
         table_controls.grid(row=1, column=0, sticky="ew", pady=(self._pad_y(8), 0))
         table_controls.grid_columnconfigure(1, weight=1)
         table_controls.grid_columnconfigure(2, weight=0)
+        table_controls.grid_columnconfigure(3, weight=0)
+        table_controls.grid_columnconfigure(4, weight=0)
         self.table_columns_toggle_button = tk.Button(
             table_controls,
             text="◀",
@@ -1347,8 +802,42 @@ class LabForgeApp(tk.Tk):
         )
         self.table_columns_panel = ttk.Frame(table_controls, style="CardAlt.TFrame")
         self.table_columns_panel.grid(row=0, column=1, sticky="ew")
+        table_search_controls = ttk.Frame(table_controls, style="CardAlt.TFrame")
+        table_search_controls.grid(row=0, column=2, sticky="e", padx=(self._pad_x(10), 0))
+        ttk.Label(
+            table_search_controls,
+            text="Поиск",
+            style="CardText.TLabel",
+        ).grid(row=0, column=0, sticky="w", padx=(0, self._pad_x(6)))
+        self.table_search_column_var = tk.StringVar(value="Время")
+        self.table_search_value_var = tk.StringVar()
+        self.table_search_column_combo = ttk.Combobox(
+            table_search_controls,
+            state="readonly",
+            width=12,
+            textvariable=self.table_search_column_var,
+            values=[label for _key, label, _width, _anchor in TABLE_COLUMN_SPECS],
+        )
+        self.table_search_column_combo.grid(row=0, column=1, sticky="w", padx=(0, self._pad_x(6)))
+        self.table_search_value_entry = ttk.Entry(
+            table_search_controls,
+            width=14,
+            textvariable=self.table_search_value_var,
+        )
+        self.table_search_value_entry.grid(row=0, column=2, sticky="w", padx=(0, self._pad_x(6)))
+        ttk.Button(
+            table_search_controls,
+            text="Найти",
+            style="Soft.TButton",
+            command=self.find_in_table,
+        ).grid(row=0, column=3, sticky="w")
         table_time_controls = ttk.Frame(table_controls, style="CardAlt.TFrame")
-        table_time_controls.grid(row=0, column=2, sticky="e", padx=(self._pad_x(10), 0))
+        table_time_controls.grid(row=0, column=3, sticky="e", padx=(self._pad_x(10), 0))
+        ttk.Label(
+            table_time_controls,
+            text="Время",
+            style="CardText.TLabel",
+        ).grid(row=0, column=0, sticky="w", padx=(0, self._pad_x(6)))
         self.table_time_format_combo = ttk.Combobox(
             table_time_controls,
             state="readonly",
@@ -1357,7 +846,7 @@ class LabForgeApp(tk.Tk):
             values=("ЧЧ:ММ:СС", "ЧЧ:ММ:СС.мс", "Дата+время", "Дата+время.мс"),
         )
         self.table_time_format_combo.grid(
-            row=0, column=0, sticky="w", padx=(0, self._pad_x(6))
+            row=0, column=1, sticky="w", padx=(0, self._pad_x(6))
         )
         self.table_time_suffix_combo = ttk.Combobox(
             table_time_controls,
@@ -1366,7 +855,7 @@ class LabForgeApp(tk.Tk):
             textvariable=self.table_time_suffix_var,
             values=("Без зоны", "местн.", "UTC+смещ."),
         )
-        self.table_time_suffix_combo.grid(row=0, column=1, sticky="w")
+        self.table_time_suffix_combo.grid(row=0, column=2, sticky="w")
         self.table_time_format_combo.bind(
             "<<ComboboxSelected>>", lambda _event: self._refresh_table_timestamps()
         )
@@ -1375,6 +864,13 @@ class LabForgeApp(tk.Tk):
         )
         self.table_time_format_combo.set("ЧЧ:ММ:СС.мс")
         self.table_time_suffix_combo.set("Без зоны")
+        ttk.Button(
+            table_controls,
+            text="Удалить не полные данные",
+            style="Soft.TButton",
+            command=self.delete_incomplete_rows,
+            width=24,
+        ).grid(row=0, column=4, sticky="e", padx=(self._pad_x(10), 0))
         for index, (key, label, _width, _anchor) in enumerate(TABLE_COLUMN_SPECS):
             var = tk.BooleanVar(value=True)
             self.table_column_vars[key] = var
@@ -1407,6 +903,7 @@ class LabForgeApp(tk.Tk):
         )
         table_scroll.grid(row=0, column=1, sticky="ns")
         self.measurements_table.configure(yscrollcommand=table_scroll.set)
+        self.measurements_table.bind("<Button-3>", self.open_table_context_menu)
         self._apply_table_column_visibility()
 
         cards = ttk.Frame(self.center_panel, style="App.TFrame")
@@ -1415,7 +912,7 @@ class LabForgeApp(tk.Tk):
             cards.grid_columnconfigure(idx, weight=1, uniform="metric")
         self.mass_card = MetricCard(cards, "Масса", "accent", value_size=40)
         self.mass_card.grid(row=0, column=0, sticky="nsew", padx=(0, self._pad_x(8)))
-        self.temp_card = MetricCard(cards, "Камера PV", "heat", value_size=40)
+        self.temp_card = MetricCard(cards, "t Камера PV", "heat", value_size=40)
         self.temp_card.grid(row=0, column=1, sticky="nsew", padx=self._pad_pair(4))
         self.thermocouple_card = MetricCard(
             cards, "Термопара SV", "warning", value_size=40
@@ -1431,10 +928,17 @@ class LabForgeApp(tk.Tk):
             cards, "Время", "border", value_size=22, unit_size=1
         )
         self.time_card.grid(row=0, column=4, sticky="nsew", padx=(self._pad_x(8), 0))
+        self.mass_card.configure_action(
+            text="⟳",
+            command=self.sync_measurement_baseline,
+            image=None,
+            tooltip="Синхронизировать начальную массу по текущему значению и перенести маркер A.",
+            visible=True,
+        )
 
         actions = ttk.Frame(self.center_panel, style="App.TFrame")
         actions.grid(row=2, column=0, sticky="ew", pady=(self._pad_y(8), 0))
-        for idx in range(5):
+        for idx in range(6):
             actions.grid_columnconfigure(idx, weight=1)
         self.start_button = ttk.Button(
             actions,
@@ -1447,75 +951,29 @@ class LabForgeApp(tk.Tk):
             actions, text="Стоп", style="Warm.TButton", command=self.stop_acquisition
         )
         self.stop_button.grid(row=0, column=1, sticky="ew", padx=self._pad_pair(3))
+        self.pause_button = ttk.Button(
+            actions, text="Пауза", style="Soft.TButton", command=self.pause_acquisition
+        )
+        self.pause_button.grid(row=0, column=2, sticky="ew", padx=self._pad_pair(3))
         self.reset_button = ttk.Button(
             actions, text="Сброс", style="Soft.TButton", command=self.clear_graph
         )
         self.reset_button.grid(
-            row=0, column=2, sticky="ew", padx=(self._pad_x(3), self._pad_x(8))
+            row=0, column=3, sticky="ew", padx=(self._pad_x(3), self._pad_x(8))
         )
         self.tare_button = ttk.Button(
             actions, text="Тара", style="Soft.TButton", command=self.tare_scale
         )
         self.tare_button.grid(
-            row=0, column=3, sticky="ew", padx=(self._pad_x(2), self._pad_x(3))
+            row=0, column=4, sticky="ew", padx=(self._pad_x(2), self._pad_x(3))
         )
         self.zero_button = ttk.Button(
             actions, text="Ноль", style="Soft.TButton", command=self.zero_scale
         )
-        self.zero_button.grid(row=0, column=4, sticky="ew", padx=(self._pad_x(6), 0))
+        self.zero_button.grid(row=0, column=5, sticky="ew", padx=(self._pad_x(6), 0))
 
     def _build_right_panel(self) -> None:
-        self.right_panel.grid_propagate(False)
-        ttk.Label(
-            self.right_panel, text="Лог и диагностика", style="CardTitle.TLabel"
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Label(
-            self.right_panel,
-            textvariable=self.diag_ports_var,
-            style="CardText.TLabel",
-            wraplength=int(360 * self.ui_scale),
-        ).grid(row=1, column=0, sticky="w", pady=(self._pad_y(6), 0))
-        ttk.Label(
-            self.right_panel,
-            textvariable=self.diag_last_sample_var,
-            style="CardText.TLabel",
-            wraplength=int(360 * self.ui_scale),
-        ).grid(row=2, column=0, sticky="w", pady=(self._pad_y(6), 0))
-        ttk.Label(
-            self.right_panel,
-            textvariable=self.diag_last_time_var,
-            style="CardText.TLabel",
-        ).grid(row=3, column=0, sticky="w", pady=(self._pad_y(6), 0))
-        ttk.Label(
-            self.right_panel,
-            textvariable=self.diag_status_var,
-            style="CardText.TLabel",
-            wraplength=int(360 * self.ui_scale),
-        ).grid(row=4, column=0, sticky="w", pady=(self._pad_y(6), self._pad_y(10)))
-
-        log_actions = ttk.Frame(self.right_panel, style="Card.TFrame")
-        log_actions.grid(row=5, column=0, sticky="ew", pady=(0, self._pad_y(8)))
-        log_actions.grid_columnconfigure(0, weight=1)
-        log_actions.grid_columnconfigure(1, weight=1)
-        ttk.Button(
-            log_actions,
-            text="Сохранить TXT",
-            style="Soft.TButton",
-            command=self.save_runtime_log,
-        ).grid(row=0, column=0, sticky="ew", padx=(0, self._pad_x(6)))
-        ttk.Button(
-            log_actions,
-            text="Папка журналов",
-            style="Soft.TButton",
-            command=self.open_logs_folder,
-        ).grid(row=0, column=1, sticky="ew", padx=(self._pad_x(6), 0))
-
-        self.log_text = ScrolledText(
-            self.right_panel, wrap="word", relief="flat", height=18
-        )
-        self.log_text.grid(row=6, column=0, sticky="nsew")
-        self.log_text.insert("end", "Журнал готов.\n")
-        self.log_text.configure(state="disabled")
+        build_right_panel_view(self)
 
     def _refresh_plot_legend(self) -> None:
         if not hasattr(self, "legend_panel"):
@@ -1523,14 +981,19 @@ class LabForgeApp(tk.Tk):
         for child in self.legend_panel.winfo_children():
             child.destroy()
 
+        ttk.Label(
+            self.legend_panel,
+            text="Легенда:",
+            style="CardText.TLabel",
+        ).grid(row=0, column=0, sticky="w", padx=(0, self._pad_x(10)))
         items = self.plotter.legend_items()
         if not items:
             ttk.Label(
                 self.legend_panel,
                 text="Нет доступных кривых для текущего режима.",
                 style="CardText.TLabel",
-            ).grid(row=0, column=0, sticky="w")
-            spacer_column = 1
+            ).grid(row=0, column=1, sticky="w")
+            spacer_column = 2
         else:
             for index, item in enumerate(items):
                 key = str(item["key"])
@@ -1550,9 +1013,9 @@ class LabForgeApp(tk.Tk):
                         self._toggle_plot_series(series_key, value_var)
                     ),
                 )
-                button.grid(row=0, column=index, sticky="w", padx=(0, self._pad_x(12)))
+                button.grid(row=0, column=index + 1, sticky="w", padx=(0, self._pad_x(12)))
                 self.legend_checkbuttons[key] = button
-            spacer_column = len(items)
+            spacer_column = len(items) + 1
         self.legend_panel.grid_columnconfigure(spacer_column, weight=1)
         legend_actions = ttk.Frame(self.legend_panel, style="Card.TFrame")
         legend_actions.grid(row=0, column=spacer_column + 1, sticky="e")
@@ -1567,6 +1030,10 @@ class LabForgeApp(tk.Tk):
         self.plot_pause_button.grid(
             row=0, column=0, sticky="e", padx=(0, self._pad_x(4))
         )
+        ToolTip(
+            self.plot_pause_button,
+            "Остановить live-сдвиг графика. Запись данных продолжается.",
+        )
         self.plot_live_button = ttk.Button(
             legend_actions,
             text="▶",
@@ -1577,13 +1044,22 @@ class LabForgeApp(tk.Tk):
         self.plot_live_button.grid(
             row=0, column=1, sticky="e", padx=(0, self._pad_x(4))
         )
-        ttk.Button(
+        ToolTip(
+            self.plot_live_button,
+            "Вернуться к текущему моменту и снова вести график за новыми данными.",
+        )
+        plot_style_button = ttk.Button(
             legend_actions,
             text="⚙",
             style="WindowIcon.TButton",
             command=self.open_plot_style_editor,
             width=3,
-        ).grid(row=0, column=2, sticky="e")
+        )
+        plot_style_button.grid(row=0, column=2, sticky="e")
+        ToolTip(
+            plot_style_button,
+            "Настроить цвет, толщину и стиль линий.",
+        )
         self.plot_live_button.state(["!disabled"] if paused else ["disabled"])
 
     def _toggle_plot_series(self, series_key: str, value_var: tk.BooleanVar) -> None:
@@ -1612,6 +1088,143 @@ class LabForgeApp(tk.Tk):
             if bool(self.table_column_vars.get(key).get())
         ]
         self.measurements_table.configure(displaycolumns=display_columns)
+
+    def _selected_table_record_index(self) -> int | None:
+        if not hasattr(self, "measurements_table"):
+            return None
+        selection = self.measurements_table.selection()
+        if not selection:
+            return None
+        children = list(self.measurements_table.get_children())
+        try:
+            return children.index(selection[0])
+        except ValueError:
+            return None
+
+    def _reload_records_after_table_edit(self, records: list[MeasurementRecord], *, status: str) -> None:
+        self._load_records_into_ui(records)
+        self._set_status(status, emit_log=False)
+
+    def delete_incomplete_rows(self) -> None:
+        if not self.measurement_records:
+            self._set_status("Нет данных для очистки.", logging.WARNING)
+            return
+        filtered = [
+            record
+            for record in self.measurement_records
+            if record.timestamp
+            and record.mass is not None
+            and record.furnace_pv is not None
+            and record.furnace_sv is not None
+        ]
+        removed = len(self.measurement_records) - len(filtered)
+        if removed <= 0:
+            self._set_status("Нечего удалять: не полные данные не найдены.", logging.WARNING)
+            return
+        confirmed = messagebox.askyesno(
+            "Удаление данных",
+            (
+                f"Вы уверены, что хотите удалить не полные данные?\n\n"
+                f"Будет удалено строк: {removed}.\n"
+                "Это приведёт к невозможности восстановить их."
+            ),
+            parent=self,
+        )
+        if not confirmed:
+            return
+        self._reload_records_after_table_edit(
+            filtered,
+            status=f"Удалено неполных строк: {removed}.",
+        )
+
+    def find_in_table(self) -> None:
+        if not hasattr(self, "measurements_table"):
+            return
+        query = self.table_search_value_var.get().strip().lower()
+        if not query:
+            self._set_status("Введите значение для поиска.", logging.WARNING)
+            return
+        selected_label = self.table_search_column_var.get().strip()
+        column_key = next(
+            (key for key, label, _width, _anchor in TABLE_COLUMN_SPECS if label == selected_label),
+            "timestamp",
+        )
+        values_index = self.table_column_order.index(column_key)
+        for item_id in self.measurements_table.get_children():
+            row_values = self.measurements_table.item(item_id, "values")
+            if values_index < len(row_values) and query in str(row_values[values_index]).lower():
+                self.measurements_table.selection_set(item_id)
+                self.measurements_table.focus(item_id)
+                self.measurements_table.see(item_id)
+                self._set_status(f"Найдена запись по колонке «{selected_label}».", emit_log=False)
+                return
+        self._set_status("Совпадений не найдено.", logging.WARNING)
+
+    def open_table_context_menu(self, event) -> None:
+        if not hasattr(self, "measurements_table"):
+            return
+        item_id = self.measurements_table.identify_row(event.y)
+        if not item_id:
+            return
+        self.measurements_table.selection_set(item_id)
+        self.measurements_table.focus(item_id)
+        menu = tk.Menu(self, tearoff=False)
+        menu.add_command(label="Удалить строку", command=self.delete_selected_table_row)
+        menu.add_command(label="Сгладить строку", command=self.smooth_selected_table_row)
+        menu.tk_popup(event.x_root, event.y_root)
+        menu.grab_release()
+
+    def delete_selected_table_row(self) -> None:
+        index = self._selected_table_record_index()
+        if index is None:
+            self._set_status("Строка таблицы не выбрана.", logging.WARNING)
+            return
+        confirmed = messagebox.askyesno(
+            "Удаление данных",
+            (
+                "Вы уверены, что хотите удалить выбранные данные?\n\n"
+                "Это приведёт к невозможности восстановить их."
+            ),
+            parent=self,
+        )
+        if not confirmed:
+            return
+        records = list(self.measurement_records)
+        del records[index]
+        self._reload_records_after_table_edit(records, status="Строка удалена из таблицы и графика.")
+
+    def smooth_selected_table_row(self) -> None:
+        index = self._selected_table_record_index()
+        if index is None:
+            self._set_status("Строка таблицы не выбрана.", logging.WARNING)
+            return
+        if index <= 0 or index >= len(self.measurement_records) - 1:
+            self._set_status("Сглаживание доступно только для внутренних строк.", logging.WARNING)
+            return
+        records = list(self.measurement_records)
+        left = records[index - 1]
+        current = records[index]
+        right = records[index + 1]
+
+        def average_optional(a, b):
+            if a is None and b is None:
+                return None
+            if a is None:
+                return b
+            if b is None:
+                return a
+            return (float(a) + float(b)) / 2.0
+
+        records[index] = MeasurementRecord(
+            timestamp=current.timestamp,
+            mass=average_optional(left.mass, right.mass),
+            furnace_pv=average_optional(left.furnace_pv, right.furnace_pv),
+            furnace_sv=average_optional(left.furnace_sv, right.furnace_sv),
+            mass_timestamp=current.mass_timestamp,
+            furnace_pv_timestamp=current.furnace_pv_timestamp,
+            furnace_sv_timestamp=current.furnace_sv_timestamp,
+        )
+        self._reload_records_after_table_edit(records, status="Строка сглажена по соседним точкам.")
 
     def toggle_table_columns_panel(self) -> None:
         self.table_columns_collapsed = not self.table_columns_collapsed
@@ -1718,6 +1331,11 @@ class LabForgeApp(tk.Tk):
             self.after_idle(self.plotter.autoscale)
 
     def open_settings_window(self) -> None:
+        if self.controller.running:
+            message = "Во время записи настройки заблокированы. Сначала поставьте запись на паузу или остановите её."
+            self._set_status(message, logging.WARNING)
+            messagebox.showwarning("Настройки заблокированы", message, parent=self)
+            return
         if hasattr(self, "_settings_window") and self._settings_window.winfo_exists():
             self._settings_window.focus_set()
             return
@@ -1967,7 +1585,7 @@ class LabForgeApp(tk.Tk):
         )
         self._make_settings_note_label(
             devices_frame,
-            "Для печи обычно выбирается USB-RS485 адаптер. Для вашего профиля DK518 по умолчанию используются регистры 0x005A и 0x005B.",
+            "Для печи обычно выбирается USB-RS485 адаптер. Ищите не только RS-485 в названии, но и системные имена драйвера адаптера: CH340, WCH, USB-SERIAL CH340, USB Serial, UART.",
             wraplength=int(640 * self.ui_scale),
         ).grid(row=1, column=2, sticky="nsew", padx=(self._pad_x(12), 0))
 
@@ -1978,10 +1596,15 @@ class LabForgeApp(tk.Tk):
             style="Card.TCheckbutton",
             takefocus=False,
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(self._pad_y(6), 0))
+        self._make_settings_note_label(
+            devices_frame,
+            "Автопоиск подбирает COM-порты отдельно для весов и печи и сразу показывает, что назначено, а что не найдено.",
+            wraplength=int(980 * self.ui_scale),
+        ).grid(row=3, column=0, columnspan=3, sticky="ew", pady=(self._pad_y(6), 0))
 
         device_buttons = ttk.Frame(devices_frame, style="Card.TFrame")
         device_buttons.grid(
-            row=3, column=0, columnspan=3, sticky="ew", pady=(self._pad_y(8), 0)
+            row=4, column=0, columnspan=3, sticky="ew", pady=(self._pad_y(8), 0)
         )
         for idx in range(4):
             device_buttons.grid_columnconfigure(idx, weight=1)
@@ -2016,7 +1639,7 @@ class LabForgeApp(tk.Tk):
             wraplength=int(840 * self.ui_scale),
             justify="left",
         ).grid(
-            row=4,
+            row=5,
             column=0,
             columnspan=3,
             sticky="w",
@@ -2027,7 +1650,7 @@ class LabForgeApp(tk.Tk):
             "Драйвер для Adam Highland HCB: HCB Highland USB Driver 64 Bit.\n"
             "Страница загрузки: https://adamequipment.co.uk/support/software-downloads.html",
             wraplength=int(980 * self.ui_scale),
-        ).grid(row=5, column=0, columnspan=3, sticky="ew", pady=(self._pad_y(10), 0))
+        ).grid(row=6, column=0, columnspan=3, sticky="ew", pady=(self._pad_y(10), 0))
         ttk.Button(
             devices_frame,
             text="Открыть страницу драйвера Adam",
@@ -2035,7 +1658,7 @@ class LabForgeApp(tk.Tk):
             command=lambda: webbrowser.open(
                 "https://adamequipment.co.uk/support/software-downloads.html"
             ),
-        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(self._pad_y(8), 0))
+        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(self._pad_y(8), 0))
         self._make_settings_note_label(
             devices_frame,
             "Быстрая настройка весов Adam для живого графика:\n"
@@ -2049,7 +1672,7 @@ class LabForgeApp(tk.Tk):
             "8. Вернитесь в режим взвешивания кнопкой [Print].\n"
             "9. В программе используйте continuous. Если поток нестабилен, включите P1 Prt и опрос командой P.",
             wraplength=int(980 * self.ui_scale),
-        ).grid(row=7, column=0, columnspan=3, sticky="ew", pady=(self._pad_y(10), 0))
+        ).grid(row=8, column=0, columnspan=3, sticky="ew", pady=(self._pad_y(10), 0))
 
         self._sync_port_display_vars()
         values = [self._settings_port_label(port) for port in self.available_ports]
@@ -2183,6 +1806,7 @@ class LabForgeApp(tk.Tk):
                 widget.configure(font=("Segoe UI", max(11, int(12 * self.ui_scale))))
             if kind == "bool":
                 widget.configure(style="Card.TCheckbutton")
+            self._settings_input_widgets.append(widget)
             widget.grid(
                 row=row, column=1, sticky="ew", pady=(self._pad_y(4), self._pad_y(4))
             )
@@ -2241,6 +1865,12 @@ class LabForgeApp(tk.Tk):
     def _run_port_autodetect(self, on_startup: bool = False) -> None:
         if on_startup and not bool(self.auto_detect_ports_var.get()):
             return
+        self.available_ports = list_available_ports()
+        self.port_map = {port.device.upper(): port for port in self.available_ports}
+        self.port_display_map = {
+            port.device.upper(): self._settings_port_label(port)
+            for port in self.available_ports
+        }
         detected = detect_preferred_ports(self.available_ports)
         assigned: list[str] = []
 
@@ -2263,17 +1893,35 @@ class LabForgeApp(tk.Tk):
         if scale_port is None:
             missing.append("весы")
 
+        status_parts: list[str] = []
         if assigned:
-            self.device_check_var.set(f"Автопоиск назначил: {', '.join(assigned)}.")
+            status_parts.append(f"назначил: {', '.join(assigned)}")
         if missing:
-            message = f"Автопоиск не обнаружил COM-порты для: {', '.join(missing)}."
-            self.port_status_var.set(message)
+            status_parts.append(f"не нашёл: {', '.join(missing)}")
+            message = f"Автопоиск не нашёл подходящие COM-порты для: {', '.join(missing)}."
+            self.port_status_var.set(
+                f"Автопоиск: {'; '.join(status_parts)}."
+                if status_parts
+                else message
+            )
+            self.device_check_var.set(
+                f"Автопоиск: {'; '.join(status_parts)}."
+                if status_parts
+                else message
+            )
             self._set_status(message, logging.WARNING)
             if on_startup:
                 messagebox.showwarning("DataFusion RT", message, parent=self)
         elif assigned:
-            self.port_status_var.set(f"Автопоиск назначил: {', '.join(assigned)}.")
-            self._set_status(self.port_status_var.get(), emit_log=not on_startup)
+            success_message = f"Автопоиск: {'; '.join(status_parts)}."
+            self.device_check_var.set(success_message)
+            self.port_status_var.set(success_message)
+            self._set_status(success_message, emit_log=not on_startup)
+        else:
+            message = "Автопоиск не нашёл подходящие COM-порты для весов и печи."
+            self.device_check_var.set(message)
+            self.port_status_var.set(message)
+            self._set_status(message, logging.WARNING)
 
     def assign_selected_to_scale(self) -> None:
         device = self._get_selected_tree_device()
@@ -2376,8 +2024,14 @@ class LabForgeApp(tk.Tk):
         )
         save_config(self.config_data, self.config_path)
         self.plotter.set_max_points(self.config_data.app.max_points_on_plot)
-        self.plotter.clear()
+        if not self._acquisition_paused:
+            self._session_started_at = None
+            self._baseline_mass = None
+            self._baseline_mass_timestamp = None
+            self._baseline_mass_samples.clear()
+            self.plotter.clear()
         self.controller.start()
+        self._acquisition_paused = False
         self._set_status("Измерение запущено.")
         self._update_action_buttons()
 
@@ -2386,14 +2040,28 @@ class LabForgeApp(tk.Tk):
             self._set_status("Опрос уже остановлен.")
             return
         self.controller.stop()
+        self._acquisition_paused = False
         self._set_status("Измерение остановлено.")
         self._update_action_buttons()
         saved = self.autosave_session()
         if saved is not None:
             self._set_status(f"Сессия автосохранена: {saved.name}", logging.INFO)
 
+    def pause_acquisition(self) -> None:
+        if not self.controller.running:
+            self._set_status("Измерение уже остановлено.", logging.WARNING)
+            return
+        self.controller.stop()
+        self._acquisition_paused = True
+        self._set_status("Измерение поставлено на паузу. Данные не читаются до повторного старта.", logging.INFO)
+        self._update_action_buttons()
+
     def clear_graph(self) -> None:
         self.plotter.clear()
+        self._session_started_at = None
+        self._baseline_mass = None
+        self._baseline_mass_timestamp = None
+        self._baseline_mass_samples.clear()
         if hasattr(self, "measurements_table"):
             for item_id in self.measurements_table.get_children():
                 self._table_timestamp_map.pop(item_id, None)
@@ -2428,248 +2096,121 @@ class LabForgeApp(tk.Tk):
             messagebox.showwarning("Экспорт данных", message, parent=self)
 
     def _build_table_export_frame(self) -> pd.DataFrame:
-        visible_columns = [
-            key
-            for key in self.table_column_order
-            if bool(self.table_column_vars[key].get())
-        ]
-        rows: list[dict[str, object]] = []
-        for row_index, item_id in enumerate(
-            self.measurements_table.get_children(), start=1
-        ):
-            values = self.measurements_table.item(item_id, "values")
-            row_map = dict(zip(self.table_column_order, values))
-            normalized: dict[str, object] = {"№": row_index}
-            for key in visible_columns:
-                header = next(
-                    (
-                        label
-                        for column_key, label, _width, _anchor in TABLE_COLUMN_SPECS
-                        if column_key == key
-                    ),
-                    key,
-                )
-                normalized[header] = row_map.get(key, "")
-            rows.append(normalized)
-        return pd.DataFrame(rows)
+        return build_table_export_df(self)
 
     def _build_session_data(self) -> dict:
-        from app.services.plotter import LivePlotter
-
-        plotter = self.plotter
-        data = {
-            "metadata": {
-                "version": "1.0",
-                "created_at": datetime.now().isoformat(),
-                "records_count": len(self.measurement_records),
-            },
-            "records": [record.as_dict() for record in self.measurement_records],
-            "plot_state": {
-                "view_mode": plotter.view_mode,
-                "render_mode": plotter.render_mode,
-                "normalization_enabled": plotter.normalization_enabled,
-                "markers_enabled": plotter.markers_enabled,
-                "heating_profile_enabled": plotter.heating_profile_enabled,
-                "cursor_probe_enabled": plotter.cursor_probe_enabled,
-                "stage_analysis_enabled": plotter.stage_analysis_enabled,
-                "series_visibility": plotter._series_visibility,
-            },
-            "config": {
-                "scale_port": self.scale_port_var.get(),
-                "furnace_port": self.furnace_port_var.get(),
-                "scale_enabled": self.config_data.scale.enabled,
-                "furnace_enabled": self.config_data.furnace.enabled,
-            },
-        }
-        return data
+        return build_session_payload(self)
 
     def save_session(self) -> None:
-        target = filedialog.asksaveasfilename(
-            parent=self,
-            title="Сохранить сессию",
-            defaultextension=".json",
-            initialfile=f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-            filetypes=[("JSON", "*.json")],
-        )
-        if not target:
-            return
-        destination = Path(target)
-        if not destination.suffix:
-            destination = destination.with_suffix(".json")
-
-        session_data = self._build_session_data()
-        try:
-            with open(destination, "w", encoding="utf-8") as f:
-                json.dump(session_data, f, indent=2, ensure_ascii=False)
-            self._set_status(f"Сессия сохранена: {destination.name}", logging.INFO)
-            messagebox.showinfo(
-                "Сохранение сессии",
-                f"Сессия сохранена в {destination.name}",
-                parent=self,
-            )
-        except Exception as e:
-            self.logger.exception("Ошибка сохранения сессии")
-            self._set_status(f"Ошибка сохранения сессии: {e}", logging.ERROR)
-            messagebox.showerror("Сохранение сессии", f"Ошибка: {e}", parent=self)
+        save_session_data(self)
 
     def autosave_session(self) -> Path | None:
-        if not self.measurement_records:
-            return None
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = self.session_autosave_dir / f"autosave_{timestamp}.json"
-        session_data = self._build_session_data()
-        try:
-            with open(filename, "w", encoding="utf-8") as f:
-                json.dump(session_data, f, indent=2, ensure_ascii=False)
-            self._cleanup_autosaves(max_count=5)
-            self.logger.info(f"Сессия автосохранена: {filename.name}")
-            return filename
-        except Exception as e:
-            self.logger.exception("Ошибка автосохранения сессии")
-            return None
+        return autosave_session_data(self)
 
     def _cleanup_autosaves(self, max_count: int = 5) -> None:
-        try:
-            files = list(self.session_autosave_dir.glob("autosave_*.json"))
-            files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-            for file in files[max_count:]:
-                file.unlink()
-                self.logger.debug(f"Удалён старый автосейв: {file.name}")
-        except Exception as e:
-            self.logger.exception("Ошибка очистки автосейвов")
+        cleanup_autosave_files(self, max_count=max_count)
 
     def _autosave_timer(self) -> None:
-        # Отменить предыдущий таймер, если есть
-        if self._autosave_timer_id is not None:
-            self.after_cancel(self._autosave_timer_id)
-
-        if self.controller.running and self.measurement_records:
-            saved = self.autosave_session()
-            if saved is not None:
-                self.logger.debug(f"Периодическое автосохранение: {saved.name}")
-
-        # Планируем следующий вызов через 1 минуту (60000 мс)
-        self._autosave_timer_id = self.after(60000, self._autosave_timer)
+        autosave_session_timer(self)
 
     def load_session(self, filepath: Path) -> bool:
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                session_data = json.load(f)
-
-            # Остановить текущее измерение
-            if self.controller.running:
-                self.controller.stop()
-
-            # Очистить текущие данные
-            self.measurement_records.clear()
-            self.plotter.clear()
-            if hasattr(self, "measurements_table"):
-                for item_id in self.measurements_table.get_children():
-                    self._table_timestamp_map.pop(item_id, None)
-                    self.measurements_table.delete(item_id)
-
-            # Загрузить записи
-            records_data = session_data.get("records", [])
-            for rec_dict in records_data:
-                # Преобразовать dict в MeasurementRecord
-                record = MeasurementRecord(
-                    timestamp=rec_dict.get("timestamp"),
-                    mass=rec_dict.get("mass"),
-                    furnace_pv=rec_dict.get("furnace_pv"),
-                    furnace_sv=rec_dict.get("furnace_sv"),
-                    mass_timestamp=rec_dict.get("mass_timestamp"),
-                    furnace_pv_timestamp=rec_dict.get("furnace_pv_timestamp"),
-                    furnace_sv_timestamp=rec_dict.get("furnace_sv_timestamp"),
-                )
-                self.measurement_records.append(record)
-                # Добавить в таблицу
-                self._append_measurement_row(record)
-                # Обновить график
-                self.plotter.update(record)
-
-            # Восстановить состояние графика
-            plot_state = session_data.get("plot_state", {})
-            if plot_state:
-                view_mode = plot_state.get("view_mode")
-                if view_mode and hasattr(self.plotter, "set_view_mode"):
-                    self.plotter.set_view_mode(view_mode)
-                render_mode = plot_state.get("render_mode")
-                if render_mode and hasattr(self.plotter, "set_render_mode"):
-                    self.plotter.set_render_mode(render_mode)
-                normalization = plot_state.get("normalization_enabled")
-                if (
-                    normalization
-                    and self.plotter.normalization_enabled != normalization
-                ):
-                    self.plotter.toggle_normalization()
-                markers = plot_state.get("markers_enabled")
-                if markers and self.plotter.markers_enabled != markers:
-                    self.plotter.toggle_markers()
-                heating_profile_enabled = plot_state.get("heating_profile_enabled")
-                if (
-                    heating_profile_enabled
-                    and self.plotter.heating_profile_enabled != heating_profile_enabled
-                ):
-                    self.plotter.toggle_heating_profile()
-                cursor_probe = plot_state.get("cursor_probe_enabled")
-                if cursor_probe and self.plotter.cursor_probe_enabled != cursor_probe:
-                    self.plotter.toggle_cursor_probe()
-                stage_analysis = plot_state.get("stage_analysis_enabled")
-                if (
-                    stage_analysis
-                    and self.plotter.stage_analysis_enabled != stage_analysis
-                ):
-                    self.plotter.toggle_stage_analysis()
-                series_visibility = plot_state.get("series_visibility", {})
-                for series_key, visible in series_visibility.items():
-                    self.plotter.set_series_visible(series_key, visible)
-
-            self._set_status(
-                f"Сессия загружена: {filepath.name} ({len(records_data)} записей)",
-                logging.INFO,
-            )
-            messagebox.showinfo(
-                "Загрузка сессии",
-                f"Сессия загружена: {len(records_data)} записей",
-                parent=self,
-            )
-            return True
-        except Exception as e:
-            self.logger.exception(f"Ошибка загрузки сессии: {filepath}")
-            self._set_status(f"Ошибка загрузки сессии: {e}", logging.ERROR)
-            messagebox.showerror("Загрузка сессии", f"Ошибка: {e}", parent=self)
-            return False
+        return load_session_data(self, filepath)
 
     def update_restore_session_menu(self) -> None:
-        if not hasattr(self, "restore_session_menu"):
-            return
-        menu = self.restore_session_menu
-        menu.delete(0, "end")
-        try:
-            files = list(self.session_autosave_dir.glob("autosave_*.json"))
-            files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-            if not files:
-                menu.add_command(label="(пусто)", state="disabled")
-                return
-            for file in files[:5]:
-                # Преобразовать имя файла в читаемую дату
-                raw = file.stem.replace("autosave_", "")
+        update_restore_session_menu_data(self)
+
+    def _normalize_imported_timestamps(self, values: list[object]) -> tuple[list[str], bool]:
+        raw_values = ["" if value is None else str(value).strip() for value in values]
+        if not raw_values:
+            return [], False
+        normalized: list[str] = []
+        parsed_datetimes: list[datetime | None] = []
+        all_clock_only = True
+        for raw in raw_values:
+            if not raw:
+                parsed_datetimes.append(None)
+                all_clock_only = False
+                continue
+            parsed_exact = coerce_timestamp(raw)
+            if parsed_exact is not None and ("T" in raw or "-" in raw or "+" in raw):
+                parsed_datetimes.append(parsed_exact)
+                all_clock_only = False
+                continue
+            clock_dt = None
+            for fmt in ("%H:%M:%S.%f", "%H:%M:%S", "%H:%M"):
                 try:
-                    dt = datetime.strptime(raw, "%Y%m%d_%H%M%S")
-                    label = dt.strftime("%Y-%m-%d %H:%M:%S")
+                    parsed = datetime.strptime(raw, fmt)
+                    clock_dt = parsed
+                    break
                 except ValueError:
-                    label = raw
-                menu.add_command(
-                    label=label, command=lambda f=file: self.load_session(f)
+                    continue
+            if clock_dt is None:
+                parsed_datetimes.append(None)
+                all_clock_only = False
+            else:
+                parsed_datetimes.append(clock_dt)
+        if not all_clock_only:
+            for raw, parsed in zip(raw_values, parsed_datetimes):
+                normalized.append(raw if raw else (parsed.isoformat() if parsed is not None else ""))
+            return normalized, False
+
+        base_day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        day_offset = 0
+        previous_seconds: int | None = None
+        for parsed in parsed_datetimes:
+            if parsed is None:
+                normalized.append("")
+                continue
+            seconds = parsed.hour * 3600 + parsed.minute * 60 + parsed.second
+            if previous_seconds is not None and seconds < previous_seconds:
+                day_offset += 1
+            previous_seconds = seconds
+            actual = base_day + timedelta(days=day_offset, seconds=seconds, microseconds=parsed.microsecond)
+            normalized.append(actual.isoformat())
+        return normalized, True
+
+    def _build_import_records_from_frame(self, df: pd.DataFrame) -> tuple[list[MeasurementRecord], bool]:
+        records: list[MeasurementRecord] = []
+        timestamps_raw: list[object] = []
+        mass_values_raw: list[object] = []
+        furnace_pv_raw: list[object] = []
+        furnace_sv_raw: list[object] = []
+
+        for _, row in df.iterrows():
+            timestamp = None
+            mass = None
+            furnace_pv = None
+            furnace_sv = None
+            for col in df.columns:
+                col_lower = str(col).lower()
+                if "timestamp" in col_lower or "время" in col_lower or "дата" in col_lower:
+                    timestamp = row[col]
+                elif "mass" in col_lower or "масса" in col_lower or "вес" in col_lower:
+                    mass = row[col]
+                elif "furnace_pv" in col_lower or "pv" in col_lower or "камера" in col_lower:
+                    furnace_pv = row[col]
+                elif "furnace_sv" in col_lower or "sv" in col_lower or "термопара" in col_lower:
+                    furnace_sv = row[col]
+            if timestamp is None and len(df.columns) > 0:
+                timestamp = row[df.columns[0]]
+            if isinstance(timestamp, pd.Timestamp):
+                timestamp = timestamp.isoformat()
+            timestamps_raw.append(timestamp)
+            mass_values_raw.append(mass)
+            furnace_pv_raw.append(furnace_pv)
+            furnace_sv_raw.append(furnace_sv)
+
+        timestamps, compatibility_mode = self._normalize_imported_timestamps(timestamps_raw)
+        for idx, timestamp in enumerate(timestamps):
+            records.append(
+                MeasurementRecord(
+                    timestamp=timestamp or "",
+                    mass=float(mass_values_raw[idx]) if mass_values_raw[idx] is not None and not pd.isna(mass_values_raw[idx]) else None,
+                    furnace_pv=float(furnace_pv_raw[idx]) if furnace_pv_raw[idx] is not None and not pd.isna(furnace_pv_raw[idx]) else None,
+                    furnace_sv=float(furnace_sv_raw[idx]) if furnace_sv_raw[idx] is not None and not pd.isna(furnace_sv_raw[idx]) else None,
                 )
-        except Exception as e:
-            self.logger.exception("Ошибка обновления меню восстановления сессии")
-            menu.add_command(label="(ошибка)", state="disabled")
-        finally:
-            menu.add_separator()
-            menu.add_command(
-                label="Импорт из файла...", command=self.import_data_from_file
             )
+        return records, compatibility_mode
 
     def import_data_from_file(self) -> None:
         filetypes = [
@@ -2696,73 +2237,14 @@ class LabForgeApp(tk.Tk):
             if path.suffix.lower() in [".csv"]:
                 df = pd.read_csv(path)
             elif path.suffix.lower() in [".xlsx", ".xls"]:
-                df = pd.read_excel(path)
+                df = read_excel_frame(path)
             else:
                 self._set_status(
                     f"Неподдерживаемый формат файла: {path.suffix}", logging.ERROR
                 )
                 return
 
-            # Преобразовать DataFrame в записи
-            records = []
-            for _, row in df.iterrows():
-                # Попробовать определить колонки
-                timestamp = None
-                mass = None
-                furnace_pv = None
-                furnace_sv = None
-
-                # Искать колонки по возможным именам
-                for col in df.columns:
-                    col_lower = str(col).lower()
-                    if (
-                        "timestamp" in col_lower
-                        or "время" in col_lower
-                        or "дата" in col_lower
-                    ):
-                        timestamp = row[col]
-                    elif (
-                        "mass" in col_lower
-                        or "масса" in col_lower
-                        or "вес" in col_lower
-                    ):
-                        mass = row[col]
-                    elif (
-                        "furnace_pv" in col_lower
-                        or "pv" in col_lower
-                        or "камера" in col_lower
-                    ):
-                        furnace_pv = row[col]
-                    elif (
-                        "furnace_sv" in col_lower
-                        or "sv" in col_lower
-                        or "термопара" in col_lower
-                    ):
-                        furnace_sv = row[col]
-
-                # Если не нашли timestamp, попробовать использовать индекс или первую колонку
-                if timestamp is None and len(df.columns) > 0:
-                    timestamp = row[df.columns[0]]
-
-                # Преобразовать timestamp в строку, если это datetime
-                if isinstance(timestamp, pd.Timestamp):
-                    timestamp = timestamp.isoformat()
-                elif timestamp is not None:
-                    timestamp = str(timestamp)
-
-                record = MeasurementRecord(
-                    timestamp=timestamp or "",
-                    mass=float(mass)
-                    if mass is not None and not pd.isna(mass)
-                    else None,
-                    furnace_pv=float(furnace_pv)
-                    if furnace_pv is not None and not pd.isna(furnace_pv)
-                    else None,
-                    furnace_sv=float(furnace_sv)
-                    if furnace_sv is not None and not pd.isna(furnace_sv)
-                    else None,
-                )
-                records.append(record)
+            records, compatibility_mode = self._build_import_records_from_frame(df)
 
             if not records:
                 self._set_status("Не удалось извлечь данные из файла", logging.WARNING)
@@ -2771,28 +2253,26 @@ class LabForgeApp(tk.Tk):
                 )
                 return
 
-            # Очистить текущие данные и загрузить новые
             if self.controller.running:
                 self.controller.stop()
-
-            self.measurement_records.clear()
-            self.plotter.clear()
-            if hasattr(self, "measurements_table"):
-                for item_id in self.measurements_table.get_children():
-                    self._table_timestamp_map.pop(item_id, None)
-                    self.measurements_table.delete(item_id)
-
-            for record in records:
-                self.measurement_records.append(record)
-                self._append_measurement_row(record)
-                self.plotter.update(record)
+            self._load_records_into_ui(records)
 
             self._set_status(
                 f"Импортировано {len(records)} записей из {path.name}", logging.INFO
             )
+            if compatibility_mode:
+                self.logger.info(
+                    "Для файла %s применён режим совместимости времени: значения ЧЧ:ММ[:СС] пересчитаны в единую шкалу от первой записи.",
+                    path.name,
+                )
             messagebox.showinfo(
                 "Импорт данных",
-                f"Успешно импортировано {len(records)} записей",
+                (
+                    f"Успешно импортировано {len(records)} записей.\n"
+                    "Режим совместимости времени применён."
+                    if compatibility_mode
+                    else f"Успешно импортировано {len(records)} записей"
+                ),
                 parent=self,
             )
 
@@ -2801,17 +2281,263 @@ class LabForgeApp(tk.Tk):
             self._set_status(f"Ошибка импорта: {e}", logging.ERROR)
             messagebox.showerror("Импорт данных", f"Ошибка: {e}", parent=self)
 
+    def open_cut_data_dialog(self) -> None:
+        if not self.measurement_records:
+            self._set_status("Нет данных для вырезания.", logging.WARNING)
+            return
+        window = tk.Toplevel(self)
+        window.title("Вырезать интервал")
+        window.transient(self)
+        window.grab_set()
+        window.protocol("WM_DELETE_WINDOW", lambda: (self.plotter.cancel_interactive_pick(), window.destroy()))
+        window.bind("<Destroy>", lambda _event: self.plotter.cancel_interactive_pick(), add="+")
+        window.geometry(f"{int(580 * self.ui_scale)}x{int(380 * self.ui_scale)}")
+        outer = ttk.Frame(window, style="Card.TFrame", padding=self._pad(16, 16))
+        outer.pack(fill="both", expand=True)
+
+        ttk.Label(outer, text="Вырезать интервал данных", style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            outer,
+            text="Введите границы в формате ЧЧ:ММ:СС или как время от старта ЧЧ:ММ:СС.",
+            style="CardText.TLabel",
+            wraplength=int(400 * self.ui_scale),
+            justify="left",
+        ).pack(anchor="w", pady=(self._pad_y(6), self._pad_y(12)))
+
+        form = ttk.Frame(outer, style="Card.TFrame")
+        form.pack(fill="x")
+        start_var = tk.StringVar()
+        end_var = tk.StringVar()
+        pick_status_var = tk.StringVar(value="Можно ввести время вручную или отметить диапазон на графике.")
+        axis_var = tk.StringVar(value="all")
+        smooth_var = tk.BooleanVar(value=True)
+        axis_choices = {
+            "all": "Все оси",
+            "mass": "Масса",
+            "temperature": "Камера PV",
+            "thermocouple": "Термопара SV",
+        }
+        for row, (label, variable) in enumerate((("Начало", start_var), ("Конец", end_var))):
+            ttk.Label(form, text=label, style="CardText.TLabel").grid(row=row, column=0, sticky="w", pady=(0, self._pad_y(8)))
+            ttk.Entry(form, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=(0, self._pad_y(8)))
+        ttk.Label(form, text="Ось", style="CardText.TLabel").grid(row=2, column=0, sticky="w", pady=(0, self._pad_y(8)))
+        axis_combo = ttk.Combobox(form, state="readonly", values=list(axis_choices.values()), width=22)
+        axis_combo.grid(row=2, column=1, sticky="ew", pady=(0, self._pad_y(8)))
+        axis_combo.set(axis_choices["all"])
+        try:
+            axis_combo.configure(font=("Segoe UI", max(11, int(12 * self.ui_scale))))
+        except Exception:
+            pass
+        form.grid_columnconfigure(1, weight=1)
+        ttk.Checkbutton(
+            outer,
+            text="Сгладить после вырезания",
+            variable=smooth_var,
+            style="Card.TCheckbutton",
+        ).pack(anchor="w", pady=(self._pad_y(10), 0))
+        ttk.Label(
+            outer,
+            textvariable=pick_status_var,
+            style="CardText.TLabel",
+            wraplength=int(400 * self.ui_scale),
+            justify="left",
+        ).pack(anchor="w", pady=(self._pad_y(8), 0))
+
+        def finish_pick(start_dt: datetime, end_dt: datetime) -> None:
+            start_var.set(self._format_pick_time(start_dt))
+            end_var.set(self._format_pick_time(end_dt))
+            pick_status_var.set("Диапазон выбран на графике. Проверьте ось и нажмите «Применить».")
+            try:
+                window.lift()
+                window.grab_set()
+                window.focus_force()
+            except Exception:
+                pass
+
+        def start_graph_pick() -> None:
+            self.plotter.begin_time_span_pick(finish_pick)
+            pick_status_var.set("На графике щёлкните начало и конец диапазона для удаления.")
+            try:
+                window.grab_release()
+                self.focus_force()
+            except Exception:
+                pass
+
+        def apply_cut() -> None:
+            reverse_axis = {label: key for key, label in axis_choices.items()}
+            axis_key = reverse_axis.get(axis_combo.get(), "all")
+            try:
+                changed = self._cut_records_by_time(
+                    start_var.get().strip(),
+                    end_var.get().strip(),
+                    axis_key=axis_key,
+                    smooth=bool(smooth_var.get()),
+                )
+            except ValueError as exc:
+                messagebox.showwarning("Вырезать интервал", str(exc), parent=window)
+                return
+            if changed <= 0:
+                self._set_status("Для указанного интервала ничего не найдено.", logging.WARNING)
+            else:
+                self._set_status(f"Обновлено записей: {changed}.", logging.INFO)
+            self.plotter.cancel_interactive_pick()
+            window.destroy()
+
+        buttons = ttk.Frame(outer, style="Card.TFrame")
+        buttons.pack(fill="x", side="bottom", pady=(self._pad_y(14), 0))
+        for idx in range(3):
+            buttons.grid_columnconfigure(idx, weight=1)
+        ttk.Button(buttons, text="Отметить на графике", style="Soft.TButton", command=start_graph_pick).grid(row=0, column=0, sticky="ew", padx=(0, self._pad_x(6)))
+        ttk.Button(buttons, text="Применить", style="Accent.TButton", command=apply_cut).grid(row=0, column=1, sticky="ew", padx=self._pad_pair(3))
+        ttk.Button(buttons, text="Закрыть", style="Soft.TButton", command=lambda: (self.plotter.cancel_interactive_pick(), window.destroy())).grid(row=0, column=2, sticky="ew", padx=(self._pad_x(6), 0))
+
+    def _parse_cut_boundary(self, raw_value: str, *, base_time: datetime) -> datetime:
+        if not raw_value:
+            raise ValueError("Нужно указать начало и конец интервала.")
+        if self.plotter.relative_time_axis_enabled:
+            for fmt in ("%H:%M:%S.%f", "%H:%M:%S", "%H:%M"):
+                try:
+                    parsed = datetime.strptime(raw_value, fmt)
+                    return base_time + timedelta(
+                        hours=parsed.hour,
+                        minutes=parsed.minute,
+                        seconds=parsed.second,
+                        microseconds=parsed.microsecond,
+                    )
+                except ValueError:
+                    continue
+        for fmt in ("%H:%M:%S.%f", "%H:%M:%S", "%H:%M"):
+            try:
+                parsed = datetime.strptime(raw_value, fmt)
+                return base_time.replace(
+                    hour=parsed.hour,
+                    minute=parsed.minute,
+                    second=parsed.second,
+                    microsecond=parsed.microsecond,
+                )
+            except ValueError:
+                continue
+        try:
+            parsed = coerce_timestamp(raw_value)
+            if parsed is not None:
+                return parsed
+        except Exception:
+            pass
+        raise ValueError("Неверный формат времени. Используйте ЧЧ:ММ:СС.")
+
+    def _format_pick_time(self, timestamp: datetime) -> str:
+        if self.plotter.relative_time_axis_enabled and self.measurement_records:
+            base_time = coerce_timestamp(self.measurement_records[0].timestamp)
+            if base_time is not None:
+                seconds = max(0, int(round((timestamp - base_time).total_seconds())))
+                hours, rem = divmod(seconds, 3600)
+                minutes, seconds = divmod(rem, 60)
+                return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return timestamp.strftime("%H:%M:%S")
+
+    def _cut_records_by_time(self, start_raw: str, end_raw: str, *, axis_key: str, smooth: bool) -> int:
+        if not self.measurement_records:
+            return 0
+        try:
+            base_time = coerce_timestamp(self.measurement_records[0].timestamp)
+            if base_time is None:
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError("Не удалось разобрать время первой записи.") from exc
+        start_dt = self._parse_cut_boundary(start_raw, base_time=base_time)
+        end_dt = self._parse_cut_boundary(end_raw, base_time=base_time)
+        if end_dt < start_dt:
+            start_dt, end_dt = end_dt, start_dt
+
+        def in_window(record: MeasurementRecord) -> bool:
+            try:
+                ts = coerce_timestamp(record.timestamp)
+                if ts is None:
+                    raise ValueError
+            except ValueError:
+                return False
+            return start_dt <= ts <= end_dt
+
+        affected_indices = [idx for idx, record in enumerate(self.measurement_records) if in_window(record)]
+        if not affected_indices:
+            return 0
+
+        updated_records = list(self.measurement_records)
+        if axis_key == "all":
+            removed_duration = end_dt - start_dt
+            updated_records = [record for record in updated_records if not in_window(record)]
+            if smooth and removed_duration.total_seconds() > 0:
+                shifted: list[MeasurementRecord] = []
+                for record in updated_records:
+                    try:
+                        ts = coerce_timestamp(record.timestamp)
+                        if ts is None:
+                            raise ValueError
+                    except ValueError:
+                        shifted.append(record)
+                        continue
+                    if ts > end_dt:
+                        shifted.append(
+                            MeasurementRecord(
+                                timestamp=(ts - removed_duration).isoformat(),
+                                mass=record.mass,
+                                furnace_pv=record.furnace_pv,
+                                furnace_sv=record.furnace_sv,
+                                mass_timestamp=self._shift_optional_timestamp(record.mass_timestamp, removed_duration, end_dt),
+                                furnace_pv_timestamp=self._shift_optional_timestamp(record.furnace_pv_timestamp, removed_duration, end_dt),
+                                furnace_sv_timestamp=self._shift_optional_timestamp(record.furnace_sv_timestamp, removed_duration, end_dt),
+                            )
+                        )
+                    else:
+                        shifted.append(record)
+                updated_records = shifted
+        else:
+            field_name = "furnace_pv" if axis_key == "temperature" else "furnace_sv" if axis_key == "thermocouple" else "mass"
+            left_index = next((idx for idx in range(affected_indices[0] - 1, -1, -1) if getattr(updated_records[idx], field_name) is not None), None)
+            right_index = next((idx for idx in range(affected_indices[-1] + 1, len(updated_records)) if getattr(updated_records[idx], field_name) is not None), None)
+            for idx in affected_indices:
+                record = updated_records[idx]
+                value = None
+                if smooth and left_index is not None and right_index is not None:
+                    left_record = updated_records[left_index]
+                    right_record = updated_records[right_index]
+                    left_value = getattr(left_record, field_name)
+                    right_value = getattr(right_record, field_name)
+                    if left_value is not None and right_value is not None:
+                        span = max(1, right_index - left_index)
+                        ratio = (idx - left_index) / span
+                        value = float(left_value) + (float(right_value) - float(left_value)) * ratio
+                updated_records[idx] = MeasurementRecord(
+                    timestamp=record.timestamp,
+                    mass=value if field_name == "mass" else record.mass,
+                    furnace_pv=value if field_name == "furnace_pv" else record.furnace_pv,
+                    furnace_sv=value if field_name == "furnace_sv" else record.furnace_sv,
+                    mass_timestamp=record.mass_timestamp,
+                    furnace_pv_timestamp=record.furnace_pv_timestamp,
+                    furnace_sv_timestamp=record.furnace_sv_timestamp,
+                )
+
+        self._load_records_into_ui(updated_records)
+        return len(affected_indices)
+
+    def _shift_optional_timestamp(self, raw_timestamp: str | None, delta: timedelta, border: datetime) -> str | None:
+        if not raw_timestamp:
+            return None
+        try:
+            timestamp = coerce_timestamp(raw_timestamp)
+            if timestamp is None:
+                raise ValueError
+        except ValueError:
+            return raw_timestamp
+        if timestamp > border:
+            return (timestamp - delta).isoformat()
+        return raw_timestamp
+
     def tare_scale(self) -> None:
         if not self._scale_actions_allowed():
             self._set_status("Тара недоступна: нет связи с весами.", logging.WARNING)
             return
-        result = self.controller.tare_scale()
-        self._set_status(
-            "Команда тары отправлена."
-            if result
-            else "Не удалось отправить команду тары.",
-            logging.INFO if result else logging.WARNING,
-        )
+        self._run_scale_command_async("тары", self.controller.tare_scale)
 
     def zero_scale(self) -> None:
         if not self._scale_actions_allowed():
@@ -2819,11 +2545,35 @@ class LabForgeApp(tk.Tk):
                 "Команда нуля недоступна: нет связи с весами.", logging.WARNING
             )
             return
-        result = self.controller.zero_scale()
+        self._run_scale_command_async("нуля", self.controller.zero_scale)
+
+    def _run_scale_command_async(self, action_name: str, action) -> None:
+        if self._scale_command_in_progress:
+            self._set_status("Команда весам уже выполняется. Дождитесь завершения.", logging.WARNING)
+            return
+        self._scale_command_in_progress = True
+        self._update_action_buttons()
+        self._set_status(f"Выполняется команда {action_name}...", emit_log=False)
+
+        def worker() -> None:
+            try:
+                result = bool(action())
+            except Exception:
+                self.logger.exception("Ошибка выполнения команды весам: %s", action_name)
+                result = False
+            self.after(0, lambda: self._finish_scale_command(action_name, result))
+
+        threading.Thread(
+            target=worker,
+            name=f"scale-{action_name}-worker",
+            daemon=True,
+        ).start()
+
+    def _finish_scale_command(self, action_name: str, result: bool) -> None:
+        self._scale_command_in_progress = False
+        self._update_action_buttons()
         self._set_status(
-            "Команда нуля отправлена."
-            if result
-            else "Не удалось отправить команду нуля.",
+            f"Команда {action_name} отправлена." if result else f"Не удалось выполнить команду {action_name}.",
             logging.INFO if result else logging.WARNING,
         )
 
@@ -2857,168 +2607,13 @@ class LabForgeApp(tk.Tk):
         self._apply_theme()
 
     def show_help_dialog(self) -> None:
-        help_window = tk.Toplevel(self)
-        help_window.title("Инструкция")
-        help_window.transient(self)
-        help_window.grab_set()
-        help_window.geometry(f"{int(760 * self.ui_scale)}x{int(620 * self.ui_scale)}")
-
-        outer = ttk.Frame(help_window, style="Card.TFrame", padding=self._pad(18, 18))
-        outer.pack(fill="both", expand=True)
-        ttk.Label(
-            outer, text="Как пользоваться программой", style="CardTitle.TLabel"
-        ).pack(anchor="w")
-
-        text = ScrolledText(outer, wrap="word", relief="flat")
-        text.pack(fill="both", expand=True, pady=(self._pad_y(12), 0))
-        text.insert(
-            "end",
-            "ПОДКЛЮЧЕНИЕ\n"
-            "1. Подключите весы и/или печь к компьютеру.\n"
-            "2. Откройте окно «Настройки».\n"
-            "3. В блоке «Устройства» выберите COM-порты и нажмите проверку.\n\n"
-            "ЗАПУСК ИЗМЕРЕНИЯ\n"
-            "1. Нажмите «Старт».\n"
-            "2. График начнет обновляться автоматически.\n"
-            "3. Крупные карточки под графиком покажут текущую массу, температуру и статус.\n\n"
-            "РАБОТА С ГРАФИКОМ\n"
-            "• Справа от графика находятся три панели: «Инструменты», «Виды» и «Анализ».\n"
-            "• Пункт «Изображение» в верхнем меню сохраняет график как PNG.\n"
-            "• Экспорт CSV и Excel в меню «Сохранить/экспорт» сохраняет таблицу измерений, а не картинку.\n\n"
-            "ИНСТРУМЕНТЫ\n"
-            "• «Курсор» — показывает координаты точки под мышью и пунктир до осей.\n"
-            "• «Сброс меток» — удаляет все закреплённые метки курсора.\n"
-            "• «🔍» — включает режим увеличения выбранной области.\n"
-            "• «Сдвиг» — перемещает уже увеличенный участок графика.\n"
-            "• «+» и «-» — быстро меняют масштаб.\n"
-            "• «Сброс» — возвращает исходный вид графика.\n"
-            "• «Авто» — подбирает автоматический масштаб по текущим данным.\n"
-            "• «Точки» — показывает отдельные измерения точками.\n"
-            "• «Линии» — обычный режим непрерывной кривой.\n"
-            "• «Сглаж.» — сглаживает отображение кривой.\n\n"
-            "АНАЛИЗ\n"
-            "• «DTG» — показывает скорость изменения массы.\n"
-            "• «Нормал.» — переводит массу в относительный масштаб.\n"
-            "• «Маркеры» — считает Δm, Δm% и ΔT между точками A/B.\n"
-            "• «Профиль нагрева» — строит эталонную линию нагрева по температурным данным.\n"
-            "• Чтобы использовать профиль нагрева: откройте «Анализ», включите кнопку, дождитесь появления чёрной линии и затем сохраняйте PNG, если она нужна в файле.\n"
-            "• «Стадии» — помогает выделить этапы процесса.\n"
-            "• «Сводка» — открывает текстовый результат расчётов.\n\n"
-            "ЕСЛИ НЕТ COM-ПОРТА\n"
-            "• Проверьте кабель и питание устройства.\n"
-            "• Установите драйвер USB-Serial или USB-RS485 адаптера.\n"
-            "• Убедитесь, что COM-порт не занят другой программой.\n\n"
-            "ЕСЛИ УСТРОЙСТВО НЕ ОТВЕЧАЕТ\n"
-            "• Проверьте скорость связи и таймаут.\n"
-            "• Для печи проверьте slave ID, регистры и линии A/B.\n"
-            "• Для весов проверьте режим передачи данных и команду опроса.\n\n"
-            "АНАЛИЗ ГРАФИКА\n"
-            "• «🔍» — выделение области для детального просмотра.\n"
-            "• «Сдвиг» — перемещение уже увеличенного графика.\n"
-            "• «+» и «-» — быстрое приближение и отдаление.\n"
-            "• «Авто» — вернуть удобный автоматический масштаб.\n"
-            "• «Сброс» — полностью восстановить исходный вид.\n",
-        )
-        text.configure(state="disabled")
-        self._apply_theme_to_toplevel(help_window, text_widget=text)
+        open_help_dialog(self)
 
     def show_tools_dialog(self) -> None:
-        tools_window = tk.Toplevel(self)
-        tools_window.title("Инструменты")
-        tools_window.transient(self)
-        tools_window.grab_set()
-        tools_window.geometry(f"{int(760 * self.ui_scale)}x{int(620 * self.ui_scale)}")
-
-        outer = ttk.Frame(tools_window, style="Card.TFrame", padding=self._pad(18, 18))
-        outer.pack(fill="both", expand=True)
-        ttk.Label(
-            outer, text="Инструменты и анализ графика", style="CardTitle.TLabel"
-        ).pack(anchor="w")
-
-        text = ScrolledText(outer, wrap="word", relief="flat")
-        text.pack(fill="both", expand=True, pady=(self._pad_y(12), 0))
-        text.insert(
-            "end",
-            "🔹 Курсор\n\n"
-            "Показывает координаты под мышью\n"
-            "Выводит X/Y у точки, рисует пунктир до осей и позволяет ставить якорные метки кликом.\n\n"
-            "🔹 Сброс меток\n\n"
-            "Очищает координатные метки\n"
-            "Удаляет все ранее поставленные якоря курсора.\n\n"
-            "🔹 Лупа / Сдвиг / Масштаб\n\n"
-            "Управление видом графика\n"
-            "Лупа выделяет область, сдвиг двигает увеличенный участок, кнопки + и - меняют масштаб, авто подбирает масштаб автоматически.\n\n"
-            "🔹 Точки / Линии / Сглаживание\n\n"
-            "Режимы отрисовки кривой\n"
-            "Позволяют переключаться между точками, обычной линией и сглаженным отображением.\n\n"
-            "🔹 DTG\n\n"
-            "Скорость изменения массы (dM/dT)\n"
-            "Показывает, где процесс идёт быстрее всего. Помогает найти стадии разложения.\n\n"
-            "🔹 Нормализация\n\n"
-            "Приведение массы к относительному виду (%)\n"
-            "Позволяет сравнивать разные эксперименты независимо от начальной массы.\n\n"
-            "🔹 Маркеры\n\n"
-            "Измерение между двумя точками графика\n"
-            "Показывает разницу массы, температуры и времени между точками A и B. Маркеры можно перетаскивать мышью по графику массы.\n\n"
-            "🔹 Профиль нагрева\n\n"
-            "Автоматическая эталонная линия нагрева\n"
-            "Строит устойчивую к шуму чёрную линию по температурным данным, определяет участок разгона и выход на плато. Включите режим в панели «Анализ», дождитесь появления линии и сохраняйте PNG только в нужном состоянии экрана.\n\n"
-            "🔹 Анализ стадий\n\n"
-            "Автоматическое определение этапов процесса\n"
-            "Находит начало и конец разложения и разбивает кривую на стадии.\n",
-        )
-        text.configure(state="disabled")
-        self._apply_theme_to_toplevel(tools_window, text_widget=text)
+        open_tools_dialog(self)
 
     def show_about_dialog(self) -> None:
-        about_window = tk.Toplevel(self)
-        about_window.title("Об авторе")
-        about_window.transient(self)
-        about_window.grab_set()
-        about_window.geometry(f"{int(560 * self.ui_scale)}x{int(340 * self.ui_scale)}")
-
-        outer = ttk.Frame(about_window, style="Card.TFrame", padding=self._pad(18, 18))
-        outer.pack(fill="both", expand=True)
-        outer.grid_columnconfigure(0, weight=1)
-
-        ttk.Label(outer, text="DataFusion RT", style="CardTitle.TLabel").grid(
-            row=0, column=0, sticky="w"
-        )
-        ttk.Label(
-            outer,
-            text="Разработчик:\nДенчик Артур Станиславович\n\nНа базе:\nФИЦ УУХ СО РАН",
-            style="CardText.TLabel",
-            justify="left",
-        ).grid(row=1, column=0, sticky="w", pady=(self._pad_y(8), self._pad_y(14)))
-
-        links = ttk.Frame(outer, style="Card.TFrame")
-        links.grid(row=2, column=0, sticky="ew")
-        links.grid_columnconfigure(0, weight=1)
-        links.grid_columnconfigure(1, weight=1)
-        ttk.Button(
-            links,
-            text="ВКонтакте",
-            style="Soft.TButton",
-            command=lambda: webbrowser.open("https://vk.com/id391500377"),
-        ).grid(row=0, column=0, sticky="ew", padx=(0, self._pad_x(6)))
-        ttk.Button(
-            links,
-            text="Исходный код",
-            style="Soft.TButton",
-            command=lambda: webbrowser.open(
-                "https://github.com/Vanagandr111/DataFusion-RT"
-            ),
-        ).grid(row=0, column=1, sticky="ew", padx=(self._pad_x(6), 0))
-
-        ttk.Button(
-            outer, text="Закрыть", style="Accent.TButton", command=about_window.destroy
-        ).grid(
-            row=3,
-            column=0,
-            sticky="ew",
-            pady=(self._pad_y(18), 0),
-        )
-        self._apply_theme_to_toplevel(about_window)
+        open_about_dialog(self)
 
     def _apply_theme(self) -> None:
         palette = self.theme_manager.palette
@@ -3472,11 +3067,17 @@ class LabForgeApp(tk.Tk):
             self._last_scale_seen_at = time.monotonic()
         if snapshot.furnace_connected:
             self._last_furnace_seen_at = time.monotonic()
+        self._capture_measurement_baseline(snapshot.record)
         self.plotter.update(snapshot.record)
         self.mass_card.set_value(
             _format_value(snapshot.record.mass, 3),
             unit="g",
             subtitle="Текущее значение",
+        )
+        self.mass_card.set_secondary(
+            f"Начальная: {_format_value(self._baseline_mass, 3)} г"
+            if self._baseline_mass is not None
+            else "Начальная: идёт фиксация"
         )
         self.temp_card.set_value(
             _format_value(snapshot.record.furnace_pv, 1), unit="°C", subtitle="Камера"
@@ -3489,8 +3090,8 @@ class LabForgeApp(tk.Tk):
         status_main, status_sub = self._status_text(snapshot)
         self.status_card.set_value(status_main, subtitle=status_sub)
         self.time_card.set_value(
-            self._format_card_timestamp(snapshot.record.timestamp),
-            subtitle="Последняя запись",
+            self._format_elapsed_time(snapshot.record.timestamp),
+            subtitle=self._format_card_timestamp(snapshot.record.timestamp),
         )
 
         if snapshot.scale_connected:
@@ -3517,13 +3118,14 @@ class LabForgeApp(tk.Tk):
         self._set_status("Измерение выполняется.", emit_log=False)
         self._update_action_buttons()
 
-    def _append_measurement_row(self, record) -> None:
+    def _append_measurement_row(self, record, *, autoscroll: bool = True) -> None:
         if not hasattr(self, "measurements_table"):
             return
         item_id = self.measurements_table.insert(
             "",
             "end",
             values=(
+                len(self.measurement_records) + 1,
                 self._format_table_timestamp(record.timestamp),
                 _format_value(record.mass, 3),
                 _format_value(record.furnace_pv, 1),
@@ -3531,16 +3133,125 @@ class LabForgeApp(tk.Tk):
             ),
         )
         self._table_timestamp_map[item_id] = record.timestamp
-        max_rows = max(50, int(self.config_data.app.max_points_on_plot))
-        children = self.measurements_table.get_children()
-        excess = len(children) - max_rows
-        if excess > 0:
-            for item_id in children[:excess]:
-                self._table_timestamp_map.pop(item_id, None)
+        if autoscroll:
+            children = self.measurements_table.get_children()
+            if children:
+                self.measurements_table.see(children[-1])
+
+    def _clear_loaded_measurements(self) -> None:
+        self.measurement_records.clear()
+        self.plotter.clear()
+        self._table_timestamp_map.clear()
+        self._baseline_mass = None
+        self._baseline_mass_timestamp = None
+        self._baseline_mass_samples.clear()
+        self._session_started_at = None
+        if hasattr(self, "measurements_table"):
+            for item_id in self.measurements_table.get_children():
                 self.measurements_table.delete(item_id)
-        children = self.measurements_table.get_children()
-        if children:
-            self.measurements_table.see(children[-1])
+
+    def _load_records_into_ui(self, records: list[MeasurementRecord]) -> None:
+        self._clear_loaded_measurements()
+        if not records:
+            return
+        records = sorted(
+            records,
+            key=lambda record: coerce_timestamp(record.timestamp) or datetime.max,
+        )
+        self.measurements_table.configure(height=min(24, max(8, len(records))))
+        for record in records:
+            self.measurement_records.append(record)
+            self._append_measurement_row(record, autoscroll=False)
+        self.plotter.extend(records)
+        last_children = self.measurements_table.get_children()
+        if last_children:
+            self.measurements_table.see(last_children[-1])
+        last_record = records[-1]
+        self.sync_measurement_baseline_from_record(last_record, emit_status=False)
+
+    def sync_measurement_baseline_from_record(self, record, *, emit_status: bool = True) -> None:
+        if record.mass is None:
+            return
+        self._apply_measurement_baseline(float(record.mass), record.timestamp, emit_status=emit_status)
+
+    def _build_summary_tab(self, parent) -> None:
+        summary_card = ttk.Frame(parent, style="Card.TFrame", padding=self._pad(12, 12))
+        summary_card.grid(row=0, column=0, sticky="nsew")
+        summary_card.grid_rowconfigure(1, weight=1)
+        summary_card.grid_columnconfigure(0, weight=1)
+        ttk.Label(summary_card, text="Отчёт измерений", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
+
+        notebook = ttk.Notebook(summary_card)
+        notebook.grid(row=1, column=0, sticky="nsew", pady=(self._pad_y(10), 0))
+        self.summary_notebook = notebook
+        self.summary_analysis_tab = self._build_scrollable_summary_page(notebook)
+        self.summary_furnace_tab = self._build_scrollable_summary_page(notebook)
+        self.summary_mass_tab = self._build_scrollable_summary_page(notebook)
+        notebook.add(self.summary_analysis_tab["container"], text="Расчёты")
+        notebook.add(self.summary_furnace_tab["container"], text="Данные печи")
+        notebook.add(self.summary_mass_tab["container"], text="Данные весов")
+
+        buttons = ttk.Frame(summary_card, style="Card.TFrame")
+        buttons.grid(row=2, column=0, sticky="ew", pady=(self._pad_y(10), 0))
+        for idx in range(2):
+            buttons.grid_columnconfigure(idx, weight=1)
+        self.summary_refresh_button = ttk.Button(
+            buttons,
+            text="Обновить данные",
+            style="Soft.TButton",
+            command=self._refresh_summary_tab,
+        )
+        self.summary_refresh_button.grid(row=0, column=0, sticky="ew", padx=(0, self._pad_x(6)))
+        self.summary_save_button = ttk.Button(
+            buttons,
+            text="Сохранить TXT",
+            style="Soft.TButton",
+            command=self._save_current_summary_tab_to_txt,
+        )
+        self.summary_save_button.grid(row=0, column=1, sticky="ew", padx=(self._pad_x(6), 0))
+        self._refresh_summary_tab()
+
+    def _build_scrollable_summary_page(self, parent):
+        container = ttk.Frame(parent, style="Card.TFrame")
+        container.grid_rowconfigure(0, weight=1)
+        container.grid_columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(
+            container,
+            highlightthickness=0,
+            bd=0,
+            background=self.theme_manager.palette.card_bg,
+        )
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        body = ttk.Frame(canvas, style="Card.TFrame")
+        window_id = canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def update_scrollregion(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            needs_scroll = body.winfo_reqheight() > canvas.winfo_height()
+            if needs_scroll:
+                scrollbar.grid()
+            else:
+                scrollbar.grid_remove()
+
+        body.bind("<Configure>", update_scrollregion)
+        canvas.bind(
+            "<Configure>",
+            lambda event, c=canvas, w=window_id: (
+                c.itemconfigure(w, width=event.width),
+                update_scrollregion(),
+            ),
+        )
+        return {
+            "container": container,
+            "canvas": canvas,
+            "body": body,
+            "scrollbar": scrollbar,
+        }
 
     def _append_log_line(self, message: str) -> None:
         self.log_text.configure(state="normal")
@@ -3648,6 +3359,22 @@ class LabForgeApp(tk.Tk):
     def _on_setting_var_changed(self, *_args) -> None:
         if self._suspend_settings_autosave:
             return
+        if self.controller.running:
+            self._suspend_settings_autosave = True
+            try:
+                self._load_settings_into_vars()
+            finally:
+                self._suspend_settings_autosave = False
+            if not self._settings_lock_notified:
+                self._settings_lock_notified = True
+                message = "Во время записи настройки менять нельзя."
+                self._set_status(message, logging.WARNING)
+                try:
+                    messagebox.showwarning("Настройки заблокированы", message, parent=getattr(self, "_settings_window", self))
+                except Exception:
+                    pass
+                self.after(1200, lambda: setattr(self, "_settings_lock_notified", False))
+            return
         if (
             "app.start_maximized" in self.setting_vars
             and "app.fullscreen" in self.setting_vars
@@ -3704,13 +3431,39 @@ class LabForgeApp(tk.Tk):
 
     def _update_settings_control_states(self) -> None:
         autosave_enabled = bool(self.autosave_settings_var.get())
+        settings_locked = self.controller.running
         if (
             hasattr(self, "settings_save_button")
             and self.settings_save_button.winfo_exists()
         ):
             self.settings_save_button.state(
-                ["disabled"] if autosave_enabled else ["!disabled"]
+                ["disabled"] if (autosave_enabled or settings_locked) else ["!disabled"]
             )
+        if hasattr(self, "settings_reset_button") and self.settings_reset_button.winfo_exists():
+            self.settings_reset_button.state(["disabled"] if settings_locked else ["!disabled"])
+        if hasattr(self, "settings_scale_combo") and self.settings_scale_combo.winfo_exists():
+            combo_state = "disabled" if settings_locked else "normal"
+            try:
+                self.settings_scale_combo.configure(state=combo_state)
+                self.settings_furnace_combo.configure(state=combo_state)
+            except Exception:
+                pass
+        for widget in getattr(self, "_settings_input_widgets", []):
+            if not hasattr(widget, "winfo_exists") or not widget.winfo_exists():
+                continue
+            try:
+                if settings_locked:
+                    widget.state(["disabled"])
+                else:
+                    if isinstance(widget, ttk.Combobox):
+                        widget.state(["!disabled", "readonly"])
+                    else:
+                        widget.state(["!disabled"])
+            except Exception:
+                try:
+                    widget.configure(state="disabled" if settings_locked else "normal")
+                except Exception:
+                    pass
         if (
             hasattr(self, "settings_mode_badge")
             and self.settings_mode_badge.winfo_exists()
@@ -3803,6 +3556,17 @@ class LabForgeApp(tk.Tk):
     def _settings_port_label(self, port: PortInfo) -> str:
         return f"{port.device} - {port.description} - {guess_port_kind(port)}"
 
+    def _bool_from_var(self, variable) -> bool:
+        try:
+            value = variable.get()
+        except Exception:
+            value = variable
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
     def _extract_port_name(self, raw_value: str) -> str:
         if not raw_value:
             return ""
@@ -3866,8 +3630,10 @@ class LabForgeApp(tk.Tk):
             self.config_data.furnace.scale_factor = self._get_float(
                 "furnace.scale_factor"
             )
+            self.config_data.furnace.register_mode_pv = self._get_int("furnace.register_mode_pv")
+            self.config_data.furnace.register_mode_sv = self._get_int("furnace.register_mode_sv")
             self.config_data.furnace.driver = self._get_str("furnace.driver").lower()
-            self.config_data.furnace.access_mode = "read_only"
+            self.config_data.furnace.access_mode = self._get_str("furnace.access_mode").lower()
             self.config_data.furnace.window_enabled = False
             self.config_data.furnace.window_period_ms = 1000
             self.config_data.furnace.window_open_ms = 120
@@ -3881,7 +3647,10 @@ class LabForgeApp(tk.Tk):
                 self.config_data.furnace.slave_id = 1
                 self.config_data.furnace.register_pv = 90
                 self.config_data.furnace.register_sv = 91
+                self.config_data.furnace.register_mode_pv = 4
+                self.config_data.furnace.register_mode_sv = 4
                 self.config_data.furnace.scale_factor = 0.1
+                self.config_data.furnace.access_mode = "read_only"
                 self.config_data.furnace.read_groups = [
                     {
                         "name": "input_temperature_block",
@@ -3916,6 +3685,8 @@ class LabForgeApp(tk.Tk):
                 ]
             else:
                 self.config_data.furnace.read_groups = []
+                if self.config_data.furnace.access_mode not in {"read_only", "active_modbus"}:
+                    self.config_data.furnace.access_mode = "active_modbus"
             self.config_data.furnace.input_type_code = self._get_int(
                 "furnace.input_type_code"
             )
@@ -4054,7 +3825,9 @@ class LabForgeApp(tk.Tk):
         panel.grid_rowconfigure(1, weight=1)
         panel.grid_columnconfigure(0, weight=1)
 
-        title_label = ttk.Label(panel, text=title, style="CardTitle.TLabel")
+        title_label = ttk.Label(
+            panel, text=title, style="CardTitle.TLabel", anchor="center", justify="center"
+        )
         title_label.grid(row=0, column=0, sticky="ew", pady=(0, self._pad_y(6)))
 
         canvas = tk.Canvas(
@@ -4109,19 +3882,42 @@ class LabForgeApp(tk.Tk):
         for mode_key, button in self.plot_mode_buttons.items():
             self._set_plot_button_selected(button, mode_key == current)
 
-    def _update_plot_render_buttons(self) -> None:
-        if not hasattr(self, "plot_lines_button"):
+    def _update_plot_range_buttons(self) -> None:
+        if not hasattr(self, "plot_range_toggle_button"):
             return
-        current = self.plotter.render_mode
-        self._set_plot_button_selected(
-            self.plot_lines_button, current == LivePlotter.RENDER_LINE
+        current = self.plotter.plot_range_mode
+        self.plot_range_toggle_button.configure(
+            text="Окно: текущее"
+            if current == LivePlotter.RANGE_SEGMENT
+            else "Окно: всё"
         )
         self._set_plot_button_selected(
-            self.plot_points_button, current == LivePlotter.RENDER_POINTS
+            self.plot_range_toggle_button, current == LivePlotter.RANGE_FULL
+        )
+
+    def _update_plot_render_buttons(self) -> None:
+        if not hasattr(self, "plot_render_toggle_button"):
+            return
+        self.plot_render_toggle_button.configure(
+            text="Кривая: точки"
+            if self.plotter.points_enabled
+            else "Кривая: линии"
         )
         self._set_plot_button_selected(
-            self.plot_smooth_button, current == LivePlotter.RENDER_SMOOTH
+            self.plot_render_toggle_button, self.plotter.points_enabled
         )
+        self._set_plot_button_selected(
+            self.plot_smooth_button, self.plotter.smooth_enabled
+        )
+
+    def _update_plot_time_axis_button(self) -> None:
+        if not hasattr(self, "plot_time_axis_button"):
+            return
+        relative = self.plotter.relative_time_axis_enabled
+        self.plot_time_axis_button.configure(
+            text="Время: от начала" if relative else "Время: часы"
+        )
+        self._set_plot_button_selected(self.plot_time_axis_button, relative)
 
     def _update_calc_buttons(self) -> None:
         if not hasattr(self, "calc_dtg_button"):
@@ -4138,6 +3934,10 @@ class LabForgeApp(tk.Tk):
         if hasattr(self, "calc_heating_profile_button"):
             self._set_plot_button_selected(
                 self.calc_heating_profile_button, self.plotter.heating_profile_enabled
+            )
+        if hasattr(self, "calc_noise_button"):
+            self._set_plot_button_selected(
+                self.calc_noise_button, self.plotter.noise_reduction_config().enabled
             )
         if hasattr(self, "calc_cursor_button"):
             self._set_plot_button_selected(
@@ -4191,25 +3991,136 @@ class LabForgeApp(tk.Tk):
             "Показана температурная дельта: масса, ΔPV и ΔSV.", emit_log=False
         )
 
-    def set_plot_lines(self) -> None:
-        self.plotter.set_render_mode(LivePlotter.RENDER_LINE)
-        self._update_plot_render_buttons()
-        self._update_calc_buttons()
-        self._set_status("Включён обычный режим линий.", emit_log=False)
+    def toggle_plot_range_mode(self) -> None:
+        target_mode = (
+            LivePlotter.RANGE_FULL
+            if self.plotter.plot_range_mode == LivePlotter.RANGE_SEGMENT
+            else LivePlotter.RANGE_SEGMENT
+        )
+        self.plotter.set_plot_range_mode(target_mode)
+        self._update_plot_range_buttons()
+        self._set_status(
+            "Режим окна графика: показывается вся кривая от начала записи."
+            if target_mode == LivePlotter.RANGE_FULL
+            else "Режим окна графика: показывается текущий сегмент по времени.",
+            emit_log=False,
+        )
 
-    def set_plot_points(self) -> None:
-        self.plotter.set_render_mode(LivePlotter.RENDER_POINTS)
+    def toggle_plot_render_mode(self) -> None:
+        points_enabled = self.plotter.toggle_points()
         self._update_plot_render_buttons()
         self._update_calc_buttons()
         self._set_status(
-            "Включён режим точек для просмотра отдельных измерений.", emit_log=False
+            "Включён режим точек для просмотра отдельных измерений."
+            if points_enabled
+            else "Включён обычный режим линий.",
+            emit_log=False,
+        )
+
+    def toggle_plot_time_axis_mode(self) -> None:
+        relative = self.plotter.toggle_time_axis_mode()
+        self._update_plot_time_axis_button()
+        self._set_status(
+            "По оси X показывается время от начала записи."
+            if relative
+            else "По оси X показывается реальное время измерений.",
+            emit_log=False,
         )
 
     def set_plot_smooth(self) -> None:
-        self.plotter.set_render_mode(LivePlotter.RENDER_SMOOTH)
+        smooth_enabled = self.plotter.toggle_smoothing()
         self._update_plot_render_buttons()
         self._update_calc_buttons()
-        self._set_status("Включён сглаженный режим отображения.", emit_log=False)
+        self._set_status(
+            "Включён сглаженный режим отображения."
+            if smooth_enabled
+            else "Сглаженный режим отображения отключён.",
+            emit_log=False,
+        )
+
+    def open_noise_reduction_menu(self) -> None:
+        window = tk.Toplevel(self)
+        window.title("Шумоподавление")
+        window.transient(self)
+        window.grab_set()
+        window.geometry(f"{int(500 * self.ui_scale)}x{int(360 * self.ui_scale)}")
+        outer = ttk.Frame(window, style="Card.TFrame", padding=self._pad(16, 16))
+        outer.pack(fill="both", expand=True)
+        config = self.plotter.noise_reduction_config()
+        enabled_var = tk.BooleanVar(value=config.enabled)
+        median_var = tk.IntVar(value=config.median_window)
+        spike_var = tk.DoubleVar(value=config.spike_threshold)
+        step_var = tk.DoubleVar(value=config.step_threshold)
+        target_map = {
+            "all": "Все линии",
+            "mass": "Масса",
+            "temperature": "Камера PV",
+            "thermocouple": "Термопара SV",
+        }
+        target_var = tk.StringVar(value=target_map.get(config.target_series, "Все линии"))
+        ttk.Checkbutton(
+            outer,
+            text="Включить шумоподавление",
+            variable=enabled_var,
+            style="Card.TCheckbutton",
+        ).pack(anchor="w")
+        form = ttk.Frame(outer, style="Card.TFrame")
+        form.pack(fill="x", pady=(self._pad_y(12), self._pad_y(8)))
+        fields = [
+            ("Линия", target_var),
+            ("Медианное окно", median_var),
+            ("Порог выброса", spike_var),
+            ("Порог шага", step_var),
+        ]
+        for row, (label, var) in enumerate(fields):
+            ttk.Label(form, text=label, style="CardText.TLabel").grid(row=row, column=0, sticky="w", pady=(0, self._pad_y(8)))
+            if label == "Линия":
+                combo = ttk.Combobox(
+                    form,
+                    state="readonly",
+                    values=list(target_map.values()),
+                    width=20,
+                    textvariable=target_var,
+                )
+                try:
+                    combo.configure(font=("Segoe UI", max(11, int(12 * self.ui_scale))))
+                except Exception:
+                    pass
+                combo.grid(row=row, column=1, sticky="ew", padx=(self._pad_x(12), 0), pady=(0, self._pad_y(8)))
+            else:
+                ttk.Entry(form, textvariable=var, width=14).grid(row=row, column=1, sticky="ew", padx=(self._pad_x(12), 0), pady=(0, self._pad_y(8)))
+        form.grid_columnconfigure(1, weight=1)
+
+        def apply_settings() -> None:
+            reverse_target_map = {value: key for key, value in target_map.items()}
+            new_config = NoiseReductionConfig(
+                enabled=bool(enabled_var.get()),
+                median_window=max(1, int(median_var.get())),
+                spike_threshold=max(0.01, float(spike_var.get())),
+                step_threshold=max(0.0, float(step_var.get())),
+                target_series=reverse_target_map.get(target_var.get(), "all"),
+            )
+            self.plotter.set_noise_reduction(new_config)
+            self._set_status("Параметры шумоподавления обновлены.", emit_log=False)
+            window.destroy()
+
+        def auto_settings() -> None:
+            reverse_target_map = {value: key for key, value in target_map.items()}
+            auto_config = self.plotter.auto_configure_noise_reduction(
+                reverse_target_map.get(target_var.get(), "all")
+            )
+            enabled_var.set(auto_config.enabled)
+            median_var.set(auto_config.median_window)
+            spike_var.set(auto_config.spike_threshold)
+            step_var.set(auto_config.step_threshold)
+
+        buttons = ttk.Frame(outer, style="Card.TFrame")
+        buttons.pack(fill="x", side="bottom")
+        ttk.Button(buttons, text="Авто", style="Soft.TButton", command=auto_settings).grid(row=0, column=0, sticky="ew", padx=(0, self._pad_x(6)))
+        ttk.Button(buttons, text="Применить", style="Accent.TButton", command=apply_settings).grid(row=0, column=1, sticky="ew", padx=self._pad_pair(3))
+        ttk.Button(buttons, text="Закрыть", style="Soft.TButton", command=window.destroy).grid(row=0, column=2, sticky="ew", padx=(self._pad_x(6), 0))
+        for idx in range(3):
+            buttons.grid_columnconfigure(idx, weight=1)
 
     def activate_calc_dtg(self) -> None:
         self.plotter.set_view_mode(LivePlotter.VIEW_DTG)
@@ -4230,6 +4141,86 @@ class LabForgeApp(tk.Tk):
             else "Нормализация массы отключена.",
             emit_log=False,
         )
+
+    def open_calc_markers_menu(self) -> None:
+        menu = tk.Menu(self, tearoff=False)
+        menu.add_command(
+            label="Выключить маркеры" if self.plotter.markers_enabled else "Включить маркеры",
+            command=self.toggle_calc_markers,
+        )
+        menu.add_command(label="Задать промежуток...", command=self.open_marker_range_dialog)
+        x = self.calc_markers_button.winfo_rootx()
+        y = self.calc_markers_button.winfo_rooty() + self.calc_markers_button.winfo_height()
+        menu.tk_popup(x, y)
+        menu.grab_release()
+
+    def open_marker_range_dialog(self) -> None:
+        if not self.measurement_records:
+            self._set_status("Нет данных для задания маркеров.", logging.WARNING)
+            return
+        window = tk.Toplevel(self)
+        window.title("Промежуток маркеров")
+        window.transient(self)
+        window.grab_set()
+        window.geometry(f"{int(420 * self.ui_scale)}x{int(220 * self.ui_scale)}")
+        outer = ttk.Frame(window, style="Card.TFrame", padding=self._pad(16, 16))
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text="Задать промежуток A/B", style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            outer,
+            text="Введите время начала и конца в формате ЧЧ:ММ:СС. Формат понимает и старые, и новые сессии.",
+            style="CardText.TLabel",
+            wraplength=int(360 * self.ui_scale),
+            justify="left",
+        ).pack(anchor="w", pady=(self._pad_y(6), self._pad_y(10)))
+        form = ttk.Frame(outer, style="Card.TFrame")
+        form.pack(fill="x")
+        start_var = tk.StringVar()
+        end_var = tk.StringVar()
+        for row, (label, var) in enumerate((("A", start_var), ("B", end_var))):
+            ttk.Label(form, text=label, style="CardText.TLabel").grid(row=row, column=0, sticky="w", pady=(0, self._pad_y(8)))
+            ttk.Entry(form, textvariable=var).grid(row=row, column=1, sticky="ew", pady=(0, self._pad_y(8)))
+        form.grid_columnconfigure(1, weight=1)
+
+        def apply_marker_range() -> None:
+            try:
+                self._set_marker_range_by_time(start_var.get().strip(), end_var.get().strip())
+            except ValueError as exc:
+                messagebox.showwarning("Промежуток маркеров", str(exc), parent=window)
+                return
+            window.destroy()
+
+        buttons = ttk.Frame(outer, style="Card.TFrame")
+        buttons.pack(fill="x", side="bottom", pady=(self._pad_y(12), 0))
+        for idx in range(2):
+            buttons.grid_columnconfigure(idx, weight=1)
+        ttk.Button(buttons, text="Применить", style="Accent.TButton", command=apply_marker_range).grid(row=0, column=0, sticky="ew", padx=(0, self._pad_x(6)))
+        ttk.Button(buttons, text="Закрыть", style="Soft.TButton", command=window.destroy).grid(row=0, column=1, sticky="ew", padx=(self._pad_x(6), 0))
+
+    def _set_marker_range_by_time(self, start_raw: str, end_raw: str) -> None:
+        if not self.measurement_records:
+            raise ValueError("Нет данных для маркеров.")
+        base_time = coerce_timestamp(self.measurement_records[0].timestamp)
+        if base_time is None:
+            raise ValueError("Не удалось разобрать время первой записи.")
+        start_dt = self._parse_cut_boundary(start_raw, base_time=base_time)
+        end_dt = self._parse_cut_boundary(end_raw, base_time=base_time)
+        if end_dt < start_dt:
+            start_dt, end_dt = end_dt, start_dt
+        if not self.plotter.markers_enabled:
+            self.plotter.toggle_markers()
+        self.plotter.sync_marker_a_to_timestamp(start_dt.isoformat())
+        self.plotter.sync_marker_b_to_timestamp(end_dt.isoformat())
+        if self.plotter.view_mode == LivePlotter.VIEW_TEMP:
+            self.plotter.set_view_mode(LivePlotter.VIEW_COMBINED)
+            self._update_plot_mode_buttons()
+            self._refresh_plot_legend()
+        self._update_calc_buttons()
+        summary = self.plotter.calculation_summary()
+        self.diag_status_var.set(
+            f"Маркеры A/B: Δm={summary['delta_mass']} | Δm%={summary['delta_mass_percent']} | ΔT={summary['delta_temperature']} | Δt={summary['delta_time']}"
+        )
+        self._set_status("Маркеры A/B выставлены по заданному промежутку.", emit_log=False)
 
     def toggle_calc_markers(self) -> None:
         active = self.plotter.toggle_markers()
@@ -4256,7 +4247,7 @@ class LabForgeApp(tk.Tk):
         self._update_calc_buttons()
         if active:
             self._set_status(
-                "Профиль нагрева включён: эталонная линия строится по температурным данным и обновляется автоматически.",
+                "Профиль нагрева включён: эталонная линия строится по данным камеры и обновляется автоматически.",
                 emit_log=False,
             )
         else:
@@ -4286,121 +4277,260 @@ class LabForgeApp(tk.Tk):
         )
 
     def show_calc_summary(self) -> None:
-        summary = self.plotter.calculation_summary()
-        message = (
-            f"Δm: {summary['delta_mass']}\n"
-            f"Δm%: {summary['delta_mass_percent']}\n"
-            f"ΔT: {summary['delta_temperature']}\n"
-            f"Δt: {summary['delta_time']}\n"
-            f"Макс. DTG: {summary['max_dtg']}\n"
-            f"Стадии: {summary['stage_range']}"
-        )
-        self.diag_status_var.set(message.replace("\n", " | "))
-        window = tk.Toplevel(self)
-        window.title("Сводка анализа")
-        window.transient(self)
-        window.grab_set()
-        window.geometry(f"{int(760 * self.ui_scale)}x{int(620 * self.ui_scale)}")
-        outer = ttk.Frame(window, style="Card.TFrame", padding=self._pad(16, 16))
-        outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="Сводка анализа", style="CardTitle.TLabel").pack(
-            anchor="w"
-        )
-        ttk.Label(
-            outer,
-            text="Итоги по текущим данным графика и активным расчётам.",
-            style="CardText.TLabel",
-            justify="left",
-        ).pack(anchor="w", pady=(self._pad_y(4), self._pad_y(10)))
+        self._refresh_summary_tab()
+        if hasattr(self, "center_content_tabs"):
+            self.center_content_tabs.select(self.summary_tab)
+        self._set_status("Открыта вкладка отчёта измерений.", emit_log=False)
 
-        metrics = ttk.Frame(outer, style="Card.TFrame")
+    def _build_summary_text(self, summary: dict[str, str], furnace: dict[str, str], mass: dict[str, str]) -> str:
+        analysis_lines = [
+            "Сводка анализа",
+            f"Изменение массы от начальной точки до конца: {summary['run_delta_mass']}",
+            f"Изменение массы от начальной точки до конца, %: {summary['run_delta_mass_percent']}",
+            f"Изменение температуры от начальной точки до конца: {summary['run_delta_temperature']}",
+            f"Время от начальной точки до конца: {summary['run_delta_time']}",
+            "",
+            "Расчёты по маркерам A/B",
+            f"Изменение массы между A и B: {summary['delta_mass']}",
+            f"Изменение массы между A и B, %: {summary['delta_mass_percent']}",
+            f"Изменение температуры между A и B: {summary['delta_temperature']}",
+            f"Время между A и B: {summary['delta_time']}",
+            f"Макс. DTG: {summary['max_dtg']}",
+            f"Стадии: {summary['stage_range']}",
+            "",
+            "Данные печи",
+            f"Источник: {furnace['source']}",
+            f"Старт нагрева: {furnace['heat_start']}",
+            f"До пика: {furnace['time_to_peak']}",
+            f"Пик: {furnace['peak_temperature']}",
+            f"Остывание до стабильности: {furnace['cooldown_to_stable']}",
+            f"Стабильная температура: {furnace['stable_temperature']}",
+            f"Минимум: {furnace['minimum_temperature']}",
+            f"Общее время: {furnace['elapsed']}",
+            "",
+            "Данные весов",
+            f"Начальная масса: {mass['initial_mass']}",
+            f"Максимальная масса: {mass['max_mass']}",
+            f"Время максимума: {mass['max_mass_time']}",
+            f"Температура при максимуме: {mass['max_mass_temp']}",
+            f"Время до максимума: {mass['max_mass_delta']}",
+            f"Минимальная масса: {mass['min_mass']}",
+            f"Время минимума: {mass['min_mass_time']}",
+            f"Температура при минимуме: {mass['min_mass_temp']}",
+            f"Время до минимума: {mass['min_mass_delta']}",
+        ]
+        return "\n".join(analysis_lines)
+
+    def _build_run_summary(self) -> dict[str, str]:
+        valid_rows = [
+            (record.timestamp, float(record.mass), record.furnace_pv)
+            for record in self.measurement_records
+            if record.mass is not None
+        ]
+        if not valid_rows:
+            return {
+                "run_delta_mass": "идёт анализ",
+                "run_delta_mass_percent": "идёт анализ",
+                "run_delta_temperature": "идёт анализ",
+                "run_delta_time": "идёт анализ",
+            }
+        baseline_mass = self._baseline_mass if self._baseline_mass is not None else valid_rows[0][1]
+        baseline_timestamp = self._baseline_mass_timestamp or valid_rows[0][0]
+        baseline_temp = next(
+            (
+                row[2]
+                for row in valid_rows
+                if row[0] == baseline_timestamp and row[2] is not None
+            ),
+            valid_rows[0][2],
+        )
+        end_mass = valid_rows[-1][1]
+        end_temp = valid_rows[-1][2]
+        delta_mass = end_mass - baseline_mass
+        delta_percent = (delta_mass / baseline_mass * 100.0) if baseline_mass not in (0, None) else None
+        delta_temp = (
+            float(end_temp) - float(baseline_temp)
+            if end_temp is not None and baseline_temp is not None
+            else None
+        )
+        return {
+            "run_delta_mass": f"{delta_mass:.3f} г",
+            "run_delta_mass_percent": f"{delta_percent:.2f} %" if delta_percent is not None else "идёт анализ",
+            "run_delta_temperature": f"{delta_temp:.1f} °C" if delta_temp is not None else "идёт анализ",
+            "run_delta_time": self._format_time_delta(baseline_timestamp, valid_rows[-1][0]),
+        }
+
+    def _build_mass_summary(self) -> dict[str, str]:
+        valid_rows = [
+            (record.timestamp, float(record.mass), record.furnace_pv)
+            for record in self.measurement_records
+            if record.mass is not None
+        ]
+        if not valid_rows:
+            return {
+                "initial_mass": "идёт анализ",
+                "max_mass": "идёт анализ",
+                "max_mass_time": "идёт анализ",
+                "max_mass_temp": "идёт анализ",
+                "max_mass_delta": "идёт анализ",
+                "min_mass": "идёт анализ",
+                "min_mass_time": "идёт анализ",
+                "min_mass_temp": "идёт анализ",
+                "min_mass_delta": "идёт анализ",
+            }
+
+        baseline_mass = self._baseline_mass if self._baseline_mass is not None else valid_rows[0][1]
+        baseline_timestamp = self._baseline_mass_timestamp or valid_rows[0][0]
+        max_row = max(valid_rows, key=lambda item: item[1])
+        min_row = min(valid_rows, key=lambda item: item[1])
+        return {
+            "initial_mass": f"{baseline_mass:.3f} г",
+            "max_mass": f"{max_row[1]:.3f} г",
+            "max_mass_time": self._format_card_timestamp(max_row[0]).replace("Текущее: ", ""),
+            "max_mass_temp": f"{_format_value(max_row[2], 1)} °C",
+            "max_mass_delta": self._format_time_delta(baseline_timestamp, max_row[0]),
+            "min_mass": f"{min_row[1]:.3f} г",
+            "min_mass_time": self._format_card_timestamp(min_row[0]).replace("Текущее: ", ""),
+            "min_mass_temp": f"{_format_value(min_row[2], 1)} °C",
+            "min_mass_delta": self._format_time_delta(baseline_timestamp, min_row[0]),
+        }
+
+    def _format_time_delta(self, left_raw: str, right_raw: str) -> str:
+        try:
+            left_dt = coerce_timestamp(left_raw)
+            right_dt = coerce_timestamp(right_raw)
+            if left_dt is None or right_dt is None:
+                raise ValueError
+        except ValueError:
+            return "--"
+        seconds = max(0, int((right_dt - left_dt).total_seconds()))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def _refresh_summary_tab(self) -> None:
+        if not hasattr(self, "summary_analysis_tab"):
+            return
+        summary = self.plotter.calculation_summary()
+        run_summary = self._build_run_summary()
+        furnace = self.plotter.furnace_summary()
+        mass = self._build_mass_summary()
+        self.diag_status_var.set(
+            f"Δm={summary['delta_mass']} | Δm%={summary['delta_mass_percent']} | ΔT={summary['delta_temperature']} | Δt={summary['delta_time']}"
+        )
+
+        analysis_sections = [
+            (
+                "Общие расчёты",
+                "Показатели всей записи от базовой точки до конца текущих данных.",
+                [
+                    ("Изменение массы от начальной точки до конца", run_summary["run_delta_mass"], "Разница между начальной или синхронизированной точкой и последней доступной записью."),
+                    ("Изменение массы от начальной точки до конца, %", run_summary["run_delta_mass_percent"], "Процентное изменение массы от базовой точки до конца записи."),
+                    ("Изменение температуры от начальной точки до конца", run_summary["run_delta_temperature"], "Изменение температуры камеры от базовой точки до последней записи."),
+                    ("Время от начальной точки до конца", run_summary["run_delta_time"], "Длительность от базовой точки до конца текущей записи."),
+                ],
+            ),
+            (
+                "Расчёты по маркерам A/B",
+                "Этот блок зависит от установленных маркеров. Если маркеры не заданы, расчёты не выполняются.",
+                [
+                    ("Изменение массы между A и B", summary["delta_mass"] if self.plotter.markers_enabled else "не задано", "Разница массы между маркерами A и B."),
+                    ("Изменение массы между A и B, %", summary["delta_mass_percent"] if self.plotter.markers_enabled else "не задано", "Процентное изменение массы между маркерами A и B."),
+                    ("Изменение температуры между A и B", summary["delta_temperature"] if self.plotter.markers_enabled else "не задано", "Изменение температуры камеры между маркерами A и B."),
+                    ("Время между A и B", summary["delta_time"] if self.plotter.markers_enabled else "не задано", "Временной интервал между маркерами A и B."),
+                ],
+            ),
+            (
+                "Дополнительный анализ",
+                "Расчёты, которые не зависят от маркеров и показывают форму процесса.",
+                [
+                    ("Макс. DTG", summary["max_dtg"], "Пиковая скорость изменения массы."),
+                    ("Стадии", summary["stage_range"], "Найденный диапазон стадий процесса."),
+                ],
+            ),
+        ]
+        furnace_specs = [
+            ("Источник", furnace["source"], "Для профиля нагрева используется камера."),
+            ("Старт нагрева", furnace["heat_start"], "Момент выхода камеры в устойчивый нагрев."),
+            ("До пика", furnace["time_to_peak"], "Время нагрева от старта до пикового перегрева."),
+            ("Пик", furnace["peak_temperature"], "Максимальная температура камеры."),
+            ("Перегрев над стабильной зоной (инерция)", furnace["overheat_above_stable"], "Насколько камера или объект перелетели выше рабочей стабильной температуры."),
+            ("Остывание до стабильности", furnace["cooldown_to_stable"], "Время от пика до стабильной зоны."),
+            ("Стабильная температура", furnace["stable_temperature"], "Оценка рабочей стабильной зоны."),
+            ("Минимум", furnace["minimum_temperature"], "Минимум по текущей сессии камеры."),
+            ("Общее время", furnace["elapsed"], "Время процесса с начала нагрева."),
+        ]
+        mass_specs = [
+            ("Начальная масса", mass["initial_mass"], "Исходная масса объекта или синхронизированная базовая точка."),
+            ("Максимальная масса", mass["max_mass"], "Наибольшее значение массы за всю текущую запись."),
+            ("Время максимума", mass["max_mass_time"], "Момент, в который была зафиксирована максимальная масса."),
+            ("Температура при максимуме", mass["max_mass_temp"], "Температура камеры в момент максимальной массы."),
+            ("Время до максимума", mass["max_mass_delta"], "Интервал от начальной точки до максимума."),
+            ("Минимальная масса", mass["min_mass"], "Наименьшее значение массы за всю текущую запись."),
+            ("Время минимума", mass["min_mass_time"], "Момент, в который была зафиксирована минимальная масса."),
+            ("Температура при минимуме", mass["min_mass_temp"], "Температура камеры в момент минимальной массы."),
+            ("Время до минимума", mass["min_mass_delta"], "Интервал от начальной точки до минимума."),
+        ]
+        self._render_summary_sections(self.summary_analysis_tab, analysis_sections)
+        self._render_summary_sections(
+            self.summary_furnace_tab,
+            [("Параметры печи", "Сводка нагрева и стабилизации камеры.", furnace_specs)],
+        )
+        self._render_summary_sections(
+            self.summary_mass_tab,
+            [("Параметры массы", "Показатели массы по всей загруженной записи.", mass_specs)],
+        )
+        summary_payload = dict(summary)
+        summary_payload.update(run_summary)
+        self._summary_export_text = self._build_summary_text(summary_payload, furnace, mass)
+
+    def _render_summary_cards(self, parent, specs: list[tuple[str, str, str]]) -> None:
+        host = parent["body"] if isinstance(parent, dict) else parent
+        for child in host.winfo_children():
+            child.destroy()
+        metrics = ttk.Frame(host, style="Card.TFrame")
         metrics.pack(fill="both", expand=True)
         for idx in range(2):
             metrics.grid_columnconfigure(idx, weight=1)
-
-        card_specs = [
-            (
-                "Δm",
-                summary["delta_mass"],
-                "Потеря или прирост массы между точками A/B.",
-            ),
-            (
-                "Δm%",
-                summary["delta_mass_percent"],
-                "То же изменение массы, но в процентах от базовой точки.",
-            ),
-            (
-                "ΔT",
-                summary["delta_temperature"],
-                "Разница температур между выбранными точками или участком.",
-            ),
-            ("Δt", summary["delta_time"], "Временной интервал между точками A и B."),
-            (
-                "Макс. DTG",
-                summary["max_dtg"],
-                "Пиковая скорость изменения массы на текущем наборе данных.",
-            ),
-            (
-                "Стадии",
-                summary["stage_range"],
-                "Найденный диапазон стадий процесса по текущему анализу.",
-            ),
-        ]
-
-        for idx, (title, value, hint) in enumerate(card_specs):
+        for idx, (title, value, hint) in enumerate(specs):
             card = ttk.Frame(metrics, style="CardAlt.TFrame", padding=self._pad(12, 10))
             row = idx // 2
             column = idx % 2
-            span = 2 if idx == len(card_specs) - 1 else 1
-            padx = (0, self._pad_x(6)) if column == 0 else (self._pad_x(6), 0)
-            if span == 2:
-                padx = (0, 0)
-            card.grid(
-                row=row,
-                column=column,
-                columnspan=span,
-                sticky="nsew",
-                padx=padx,
-                pady=(0, self._pad_y(10)),
-            )
+            card.grid(row=row, column=column, sticky="nsew", padx=self._pad_pair(4), pady=(0, self._pad_y(10)))
             ttk.Label(card, text=title, style="Subtitle.TLabel").pack(anchor="w")
-            value_label = ttk.Label(
-                card,
-                text=str(value),
-                style="CardTitle.TLabel",
-                justify="left",
-                wraplength=int(300 * self.ui_scale)
-                if span == 1
-                else int(640 * self.ui_scale),
-            )
-            value_label.configure(
-                font=("Segoe UI Semibold", max(16, int(19 * self.ui_scale)))
-            )
+            value_label = ttk.Label(card, text=str(value), style="CardTitle.TLabel", justify="left", wraplength=int(320 * self.ui_scale))
+            value_label.configure(font=("Segoe UI Semibold", max(16, int(19 * self.ui_scale))))
             value_label.pack(anchor="w", pady=(self._pad_y(4), self._pad_y(6)))
-            hint_label = ttk.Label(
-                card,
-                text=hint,
+            ttk.Label(card, text=hint, style="CardText.TLabel", justify="left", wraplength=int(320 * self.ui_scale)).pack(anchor="w")
+        if isinstance(parent, dict):
+            parent["canvas"].configure(scrollregion=parent["canvas"].bbox("all"))
+
+    def _render_summary_sections(self, parent, sections: list[tuple[str, str, list[tuple[str, str, str]]]]) -> None:
+        host = parent["body"] if isinstance(parent, dict) else parent
+        for child in host.winfo_children():
+            child.destroy()
+        for section_title, section_hint, specs in sections:
+            shell = ttk.Frame(host, style="Card.TFrame", padding=self._pad(10, 10))
+            shell.pack(fill="x", expand=True, pady=(0, self._pad_y(10)))
+            ttk.Label(shell, text=section_title, style="CardTitle.TLabel").pack(anchor="w")
+            ttk.Label(
+                shell,
+                text=section_hint,
                 style="CardText.TLabel",
                 justify="left",
-                wraplength=int(300 * self.ui_scale)
-                if span == 1
-                else int(640 * self.ui_scale),
-            )
-            hint_label.pack(anchor="w")
+                wraplength=int(720 * self.ui_scale),
+            ).pack(anchor="w", pady=(self._pad_y(4), self._pad_y(10)))
+            cards_host = ttk.Frame(shell, style="Card.TFrame")
+            cards_host.pack(fill="x", expand=True)
+            self._render_summary_cards(cards_host, specs)
+        if isinstance(parent, dict):
+            parent["canvas"].configure(scrollregion=parent["canvas"].bbox("all"))
 
-        buttons = ttk.Frame(outer, style="Card.TFrame")
-        buttons.pack(fill="x", pady=(self._pad_y(6), 0))
-        buttons.grid_columnconfigure(0, weight=1)
-        buttons.grid_columnconfigure(1, weight=1)
-        ttk.Button(
-            buttons,
-            text="Сохранить TXT",
-            style="Soft.TButton",
-            command=lambda: self._save_calc_summary_to_txt(message, parent=window),
-        ).grid(row=0, column=0, sticky="ew", padx=(0, self._pad_x(6)))
-        ttk.Button(
-            buttons, text="Закрыть", style="Soft.TButton", command=window.destroy
-        ).grid(row=0, column=1, sticky="ew", padx=(self._pad_x(6), 0))
+    def _save_current_summary_tab_to_txt(self) -> None:
+        self._refresh_summary_tab()
+        self._save_calc_summary_to_txt(self._summary_export_text, parent=self)
 
     def _save_calc_summary_to_txt(self, message: str, *, parent) -> None:
         target = filedialog.asksaveasfilename(
@@ -4748,7 +4878,7 @@ class LabForgeApp(tk.Tk):
         )
         self.plot_live_button.state(["!disabled"] if paused else ["disabled"])
         self._set_status(
-            "Отрисовка графика поставлена на паузу."
+            "Live-движение графика остановлено, запись данных продолжается."
             if paused
             else "Пауза графика снята.",
             emit_log=False,
@@ -4814,9 +4944,8 @@ class LabForgeApp(tk.Tk):
         return ""
 
     def _format_table_timestamp(self, raw_timestamp: str) -> str:
-        try:
-            dt = datetime.fromisoformat(raw_timestamp)
-        except ValueError:
+        dt = coerce_timestamp(raw_timestamp)
+        if dt is None:
             cleaned = raw_timestamp.replace("T", " ")
             return cleaned
         selection = (
@@ -4845,30 +4974,182 @@ class LabForgeApp(tk.Tk):
             values = list(self.measurements_table.item(item_id, "values"))
             if not values:
                 continue
-            values[0] = self._format_table_timestamp(raw_timestamp)
+            timestamp_index = self.table_column_order.index("timestamp")
+            values[timestamp_index] = self._format_table_timestamp(raw_timestamp)
             self.measurements_table.item(item_id, values=values)
 
     def _format_card_timestamp(self, raw_timestamp: str) -> str:
-        try:
-            dt = datetime.fromisoformat(raw_timestamp)
-            return dt.strftime("%H:%M:%S")
-        except ValueError:
+        dt = coerce_timestamp(raw_timestamp)
+        if dt is not None:
+            return f"Текущее: {dt.strftime('%H:%M:%S')}"
+        else:
             cleaned = raw_timestamp.replace("T", " ")
             if len(cleaned) >= 19:
-                return cleaned[11:19]
-            return cleaned
+                return f"Текущее: {cleaned[11:19]}"
+            return f"Текущее: {cleaned}"
+
+    def _format_elapsed_time(self, raw_timestamp: str) -> str:
+        current = coerce_timestamp(raw_timestamp)
+        if current is None:
+            return "--:--"
+        if self._session_started_at is None:
+            self._session_started_at = current
+        elapsed = max(0, int((current - self._session_started_at).total_seconds()))
+        hours, remainder = divmod(elapsed, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def _capture_measurement_baseline(self, record) -> None:
+        current = coerce_timestamp(record.timestamp)
+        if current is None:
+            return
+        if self._session_started_at is None:
+            self._session_started_at = current
+        if record.mass is None:
+            return
+        if self._baseline_mass is None:
+            self._baseline_mass = float(record.mass)
+            self._baseline_mass_timestamp = record.timestamp
+            self._baseline_mass_samples = [float(record.mass)]
+            self.mass_card.set_secondary(
+                f"Начальная: {_format_value(self._baseline_mass, 3)} г"
+            )
+
+    def sync_measurement_baseline(self) -> None:
+        if not self.measurement_records:
+            self._set_status("Нет данных для синхронизации начальной точки.", logging.WARNING)
+            return
+        self.open_mass_sync_dialog()
+
+    def open_mass_sync_dialog(self) -> None:
+        if not self.measurement_records:
+            self._set_status("Нет данных для синхронизации начальной точки.", logging.WARNING)
+            return
+        first_record = next((record for record in self.measurement_records if record.mass is not None), None)
+        last_record = next((record for record in reversed(self.measurement_records) if record.mass is not None), None)
+        if first_record is None or last_record is None:
+            self._set_status("Нет доступной массы для синхронизации.", logging.WARNING)
+            return
+        window = tk.Toplevel(self)
+        window.title("Синхронизация начальной массы")
+        window.transient(self)
+        window.grab_set()
+        window.protocol("WM_DELETE_WINDOW", lambda: (self.plotter.cancel_interactive_pick(), window.destroy()))
+        window.geometry(f"{int(620 * self.ui_scale)}x{int(420 * self.ui_scale)}")
+        outer = ttk.Frame(window, style="Card.TFrame", padding=self._pad(16, 16))
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text="Синхронизация начальной массы", style="CardTitle.TLabel").pack(anchor="w")
+        default_record = first_record
+        picked_value_var = tk.StringVar(value=_format_value(default_record.mass, 3))
+        picked_timestamp_var = tk.StringVar(value=default_record.timestamp)
+        picked_source_var = tk.StringVar(value="Первая точка")
+        ttk.Label(
+            outer,
+            text="Укажите массу вручную или выберите точку на графике.",
+            style="CardText.TLabel",
+            wraplength=int(420 * self.ui_scale),
+            justify="left",
+        ).pack(anchor="w", pady=(self._pad_y(6), self._pad_y(10)))
+        form = ttk.Frame(outer, style="Card.TFrame")
+        form.pack(fill="x")
+        ttk.Label(form, text="Масса", style="CardText.TLabel").grid(row=0, column=0, sticky="w", pady=(0, self._pad_y(8)))
+        ttk.Entry(form, textvariable=picked_value_var).grid(row=0, column=1, sticky="ew", pady=(0, self._pad_y(8)))
+        ttk.Label(form, text="Первая точка", style="CardText.TLabel").grid(row=1, column=0, sticky="w", pady=(0, self._pad_y(6)))
+        ttk.Label(form, text=f"{_format_value(first_record.mass, 3)} г | {self._format_card_timestamp(first_record.timestamp).replace('Текущее: ', '')}", style="CardText.TLabel").grid(row=1, column=1, sticky="w", pady=(0, self._pad_y(6)))
+        ttk.Label(form, text="Текущая точка", style="CardText.TLabel").grid(row=2, column=0, sticky="w", pady=(0, self._pad_y(6)))
+        ttk.Label(form, text=f"{_format_value(last_record.mass, 3)} г | {self._format_card_timestamp(last_record.timestamp).replace('Текущее: ', '')}", style="CardText.TLabel").grid(row=2, column=1, sticky="w", pady=(0, self._pad_y(6)))
+        ttk.Label(form, text="Источник", style="CardText.TLabel").grid(row=3, column=0, sticky="w", pady=(0, self._pad_y(6)))
+        ttk.Label(form, textvariable=picked_source_var, style="CardText.TLabel").grid(row=3, column=1, sticky="w", pady=(0, self._pad_y(6)))
+        form.grid_columnconfigure(1, weight=1)
+
+        def use_record(record: MeasurementRecord, source_label: str) -> None:
+            if record.mass is None:
+                return
+            picked_value_var.set(_format_value(record.mass, 3))
+            picked_timestamp_var.set(record.timestamp)
+            picked_source_var.set(source_label)
+
+        def finish_graph_pick(payload: dict[str, object]) -> None:
+            mass_value = payload.get("mass")
+            timestamp = payload.get("timestamp")
+            if mass_value is None or timestamp is None:
+                return
+            picked_value_var.set(_format_value(float(mass_value), 3))
+            picked_timestamp_var.set(str(timestamp))
+            picked_source_var.set("Точка с графика")
+            try:
+                window.lift()
+                window.grab_set()
+                window.focus_force()
+            except Exception:
+                pass
+
+        def start_graph_pick() -> None:
+            self.plotter.begin_point_pick(finish_graph_pick)
+            picked_source_var.set("Выбор на графике...")
+            try:
+                window.grab_release()
+                self.focus_force()
+            except Exception:
+                pass
+
+        quick = ttk.Frame(outer, style="Card.TFrame")
+        quick.pack(fill="x", pady=(self._pad_y(10), 0))
+        for idx in range(3):
+            quick.grid_columnconfigure(idx, weight=1)
+        ttk.Button(quick, text="Взять первую", style="Soft.TButton", command=lambda: use_record(first_record, "Первая точка")).grid(row=0, column=0, sticky="ew", padx=(0, self._pad_x(6)))
+        ttk.Button(quick, text="Взять текущую", style="Soft.TButton", command=lambda: use_record(last_record, "Текущая точка")).grid(row=0, column=1, sticky="ew", padx=self._pad_pair(3))
+        ttk.Button(quick, text="Режим курсора", style="Soft.TButton", command=start_graph_pick).grid(row=0, column=2, sticky="ew", padx=(self._pad_x(6), 0))
+
+        def apply_sync() -> None:
+            try:
+                baseline_value = float(str(picked_value_var.get()).replace(",", "."))
+            except ValueError:
+                messagebox.showwarning("Синхронизация массы", "Введите корректное число массы.", parent=window)
+                return
+            baseline_timestamp = picked_timestamp_var.get().strip() or first_record.timestamp
+            self._apply_measurement_baseline(baseline_value, baseline_timestamp, emit_status=True)
+            self.plotter.cancel_interactive_pick()
+            window.destroy()
+
+        buttons = ttk.Frame(outer, style="Card.TFrame")
+        buttons.pack(fill="x", side="bottom", pady=(self._pad_y(14), 0))
+        for idx in range(2):
+            buttons.grid_columnconfigure(idx, weight=1)
+        ttk.Button(buttons, text="Применить", style="Accent.TButton", command=apply_sync).grid(row=0, column=0, sticky="ew", padx=(0, self._pad_x(6)))
+        ttk.Button(buttons, text="Закрыть", style="Soft.TButton", command=lambda: (self.plotter.cancel_interactive_pick(), window.destroy())).grid(row=0, column=1, sticky="ew", padx=(self._pad_x(6), 0))
+
+    def _apply_measurement_baseline(self, baseline_mass: float, baseline_timestamp: str, *, emit_status: bool) -> None:
+        self._baseline_mass = float(baseline_mass)
+        self._baseline_mass_timestamp = baseline_timestamp
+        self._baseline_mass_samples.clear()
+        self.mass_card.set_secondary(f"Начальная: {_format_value(self._baseline_mass, 3)} г")
+        try:
+            self._session_started_at = coerce_timestamp(baseline_timestamp)
+            if self._session_started_at is None:
+                raise ValueError
+        except ValueError:
+            self._session_started_at = None
+        self.plotter.sync_marker_a_to_timestamp(baseline_timestamp)
+        if emit_status:
+            self._set_status("Начальная точка синхронизирована.", emit_log=False)
 
     def _reset_readouts(self) -> None:
         self.last_scale_connected = False
         self.last_furnace_connected = False
         self._last_scale_seen_at = 0.0
         self._last_furnace_seen_at = 0.0
+        self._session_started_at = None
+        self._baseline_mass = None
+        self._baseline_mass_timestamp = None
+        self._baseline_mass_samples.clear()
         self.measurement_records.clear()
         self.mass_card.set_value("--", unit="g", subtitle="Ожидание данных")
+        self.mass_card.set_secondary("Начальная: --")
         self.temp_card.set_value("--", unit="°C", subtitle="Камера")
         self.thermocouple_card.set_value("--", unit="°C", subtitle="Термопара")
         self.status_card.set_value("Ожидание", subtitle="Нажмите «Старт»")
-        self.time_card.set_value("--", subtitle="Последняя запись")
+        self.time_card.set_value("--:--", subtitle="Текущее: --")
         self.diag_last_sample_var.set("Последний сэмпл: --")
         self.diag_last_time_var.set("Время: --")
         self._refresh_diagnostics()
@@ -4896,11 +5177,14 @@ class LabForgeApp(tk.Tk):
         self.stop_button.state(
             ["!disabled"] if self.controller.running else ["disabled"]
         )
+        self.pause_button.state(
+            ["!disabled"] if self.controller.running else ["disabled"]
+        )
         self.tare_button.state(
-            ["!disabled"] if self._scale_actions_allowed() else ["disabled"]
+            ["!disabled"] if (self._scale_actions_allowed() and not self._scale_command_in_progress) else ["disabled"]
         )
         self.zero_button.state(
-            ["!disabled"] if self._scale_actions_allowed() else ["disabled"]
+            ["!disabled"] if (self._scale_actions_allowed() and not self._scale_command_in_progress) else ["disabled"]
         )
 
     def save_runtime_log(self) -> None:
