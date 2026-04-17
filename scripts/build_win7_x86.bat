@@ -54,7 +54,7 @@ if exist "%STAGE_DIST_DIR%" rmdir /s /q "%STAGE_DIST_DIR%"
 if exist "%ZIP_PATH%" del /q "%ZIP_PATH%"
 
 echo Building Win7 x86 package...
-pyinstaller --noconfirm --clean --windowed --onedir --exclude-module multiprocessing --exclude-module _multiprocessing --exclude-module concurrent.futures.process --hidden-import secrets --hidden-import openpyxl --collect-submodules openpyxl --name DataFusion-RT --distpath "%STAGE_DIST_DIR%" --workpath "%BUILD_DIR%" --specpath "%BUILD_DIR%" app\main.py
+pyinstaller --noconfirm --clean --windowed --onedir --exclude-module multiprocessing --exclude-module _multiprocessing --exclude-module concurrent.futures.process --exclude-module pkg_resources --exclude-module setuptools --exclude-module _distutils_hack --hidden-import secrets --hidden-import openpyxl --collect-submodules openpyxl --name DataFusion-RT --distpath "%STAGE_DIST_DIR%" --workpath "%BUILD_DIR%" --specpath "%BUILD_DIR%" app\main.py
 if errorlevel 1 goto :error
 
 if not exist "%STAGE_PACKAGE_DIR%\config" mkdir "%STAGE_PACKAGE_DIR%\config"

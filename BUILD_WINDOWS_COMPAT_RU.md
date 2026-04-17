@@ -58,6 +58,7 @@
   - `api-ms-win-crt-*.dll`
 - в build добавлен `hidden-import secrets`, чтобы stdlib-модуль не терялся в legacy сборке
 - для legacy `Win7` сборки из PyInstaller исключён `multiprocessing`, потому что приложению он не нужен, а его runtime hook тянет `_socket` и может падать на старом Win7 ещё до запуска GUI
+- для legacy `Win7` сборки также исключены `pkg_resources` / `setuptools`, потому что их runtime hook тоже может тянуть `email -> socket -> _socket` и падать на старом Win7 ещё до старта интерфейса
 
 ## Что с Windows XP
 
